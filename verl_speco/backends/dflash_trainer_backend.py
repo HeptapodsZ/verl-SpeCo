@@ -31,6 +31,10 @@ from verl_speco.models.dflash import (
     build_target_layer_ids,
 )
 from verl_speco.models.dflash.flex_attention import compile_friendly_create_block_mask
+from verl_speco.models.dflash.kernels import (
+    DFLASH_ATTENTION_BACKENDS,
+    build_dflash_dense_attention_mask,
+)
 from verl_speco.models.target.target_head import TargetHead
 from verl_speco.trainer.checkpoint import log_drafter_checkpoint_step
 
@@ -91,33 +95,9 @@ def _create_dflash_dense_attention_mask(
     keys that are visible to each draft query.
     """
 
-    bsz, num_blocks = anchor_positions.shape
-    device = anchor_positions.device
-    draft_len = num_blocks * block_size
-
-    query_indices = torch.arange(draft_len, device=device)
-    query_block_ids = query_indices // block_size
-    query_anchors = anchor_positions.index_select(1, query_block_ids)
-    query_valid = block_keep_mask.index_select(1, query_block_ids)
-
-    context_indices = torch.arange(ctx_len, device=device)
-    context_allowed = context_indices.view(1, 1, ctx_len) < query_anchors.unsqueeze(-1)
-
-    draft_block_ids = torch.arange(draft_len, device=device) // block_size
-    draft_allowed = (
-        query_block_ids.view(1, draft_len, 1) == draft_block_ids.view(1, 1, draft_len)
-    ).expand(bsz, -1, -1)
-    allowed = torch.cat([context_allowed, draft_allowed], dim=-1)
-
-    # Some SDPA kernels do not define fully masked rows safely. Dummy anchor
-    # rows are excluded from every loss, so let each one attend only to itself.
-    total_len = ctx_len + draft_len
-    key_indices = torch.arange(total_len, device=device)
-    safe_self = key_indices.view(1, 1, total_len) == (ctx_len + query_indices).view(
-        1, draft_len, 1
+    return build_dflash_dense_attention_mask(
+        anchor_positions, block_keep_mask, ctx_len, block_size
     )
-    allowed = torch.where(query_valid.unsqueeze(-1), allowed, safe_self)
-    return allowed.unsqueeze(1)
 
 
 class DFlashTrainingModel(nn.Module):
@@ -140,6 +120,7 @@ class DFlashTrainingModel(nn.Module):
         front_position_count: int = 0,
         loss_mode: str = "full_vocab",
         sampled_ce_negatives: int = 0,
+        attention_backend: str = "auto",
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -151,6 +132,12 @@ class DFlashTrainingModel(nn.Module):
         self.front_position_count = max(int(front_position_count), 0)
         self.loss_mode = str(loss_mode or "full_vocab")
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
+        self.attention_backend = str(attention_backend or "auto").lower()
+        if self.attention_backend not in DFLASH_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"Unknown DFlash attention backend {self.attention_backend!r}; "
+                f"expected one of {sorted(DFLASH_ATTENTION_BACKENDS)}"
+            )
         self._tensor_template_cache: dict[tuple, torch.Tensor] = {}
 
     def _cached_arange(
@@ -327,7 +314,12 @@ class DFlashTrainingModel(nn.Module):
 
         block_mask = None
         dense_attention_mask = None
-        if device.type == "cuda":
+        selected_backend = self.attention_backend
+        if selected_backend == "auto":
+            selected_backend = "flex" if device.type == "cuda" else "sdpa"
+        if selected_backend == "flex":
+            if device.type != "cuda":
+                raise RuntimeError("DFlash flex attention is supported only on CUDA")
             block_mask = compile_friendly_create_block_mask(
                 mask_mod=_create_dflash_mask_mod(
                     anchor_positions, block_keep_mask, seq_len, self.block_size
@@ -338,7 +330,7 @@ class DFlashTrainingModel(nn.Module):
                 KV_LEN=seq_len + draft_len,
                 device=device,
             )
-        else:
+        elif selected_backend == "sdpa":
             dense_attention_mask = _create_dflash_dense_attention_mask(
                 anchor_positions,
                 block_keep_mask,
@@ -354,6 +346,16 @@ class DFlashTrainingModel(nn.Module):
             block_mask=block_mask,
             dense_attention_mask=dense_attention_mask,
             noise_embedding=noise_embedding,
+            attention_backend=selected_backend,
+            anchor_positions=(
+                anchor_positions if selected_backend in ("triton", "tilelang") else None
+            ),
+            block_keep_mask=(
+                block_keep_mask if selected_backend in ("triton", "tilelang") else None
+            ),
+            block_size=(
+                self.block_size if selected_backend in ("triton", "tilelang") else None
+            ),
         )
         label_offsets = self._cached_arange(
             "label_offsets", self.block_size, device, view_shape=(1, 1, -1)
@@ -999,6 +1001,9 @@ class DFlashTrainerBackend:
             loss_mode=str(training_cfg.get("dflash_loss_mode", "full_vocab")),
             sampled_ce_negatives=int(
                 training_cfg.get("dflash_sampled_ce_negatives", 0)
+            ),
+            attention_backend=str(
+                training_cfg.get("dflash_attention_backend", "auto")
             ),
         ), drafter_config
 

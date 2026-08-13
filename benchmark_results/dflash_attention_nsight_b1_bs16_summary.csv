@@ -1,0 +1,9 @@
+achieved_occupancy_pct,block_size,branch_efficiency_pct,compute_sm_pct,dram_pct,duration_us,dynamic_shared_memory_kib,grid_size,issue_slots_busy_pct,kernel,l2_hit_pct,l2_throughput_pct,memory_throughput_gbps,no_eligible_pct,registers_per_thread,source_report,theoretical_occupancy_pct,warp_cycles_per_issued
+16.01,"(128, 1, 1)",100.0,27.38,16.13,97.92,45.06,"(64, 16, 1)",17.83,_forward_kernel,85.5,39.01,152.53,79.47,236.0,triton_forward_b1_c512_bs16.ncu-rep,16.67,9.36
+7.99,"(64, 1, 1)",100.0,20.74,20.24,125.09,40.96,"(64, 16, 1)",8.07,main_kernel,89.21,34.44,191.44,89.48,242.0,tilelang_forward_b1_c512_bs16.ncu-rep,8.33,10.31
+16.06,"(128, 1, 1)",100.0,32.63,4.61,1080.0,45.06,"(64, 16, 1)",16.86,_forward_kernel,97.5,47.63,43.63,80.6,236.0,triton_forward_b1_c8192_bs16.ncu-rep,16.67,9.95
+15.28,"(128, 1, 1)",100.0,29.33,4.16,1200.0,49.15,"(64, 8, 1)",9.69,main_kernel,95.63,21.94,39.38,87.21,188.0,tilelang_forward_b1_c8192_bs16.ncu-rep,16.67,14.3
+16.06,"(128, 1, 1)",100.0,33.22,5.41,9760.0,45.06,"(64, 16, 1)",16.85,_forward_kernel,97.89,48.91,44.07,80.65,236.0,triton_forward_b1_c65536_bs16.ncu-rep,16.67,9.98
+15.26,"(128, 1, 1)",100.0,29.87,5.11,10010.0,49.15,"(64, 8, 1)",9.78,main_kernel,94.23,22.3,45.14,87.25,188.0,tilelang_forward_b1_c65536_bs16.ncu-rep,16.67,14.37
+16.65,"(128, 1, 1)",100.0,45.54,5.83,13630.0,10.24,"(1024, 8, 1)",9.62,_backward_dkv_context_kernel,91.74,19.33,49.56,90.24,255.0,triton_dkv_context_b1_c65536_bs16.ncu-rep,16.67,20.47
+15.48,"(128, 1, 1)",100.0,31.55,3.82,15290.0,43.01,"(64, 8, 1)",9.21,main_kernel,94.33,16.02,31.37,88.48,168.0,tilelang_dkv_context_b1_c65536_bs16.ncu-rep,16.67,16.06

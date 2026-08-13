@@ -24,6 +24,7 @@ from transformers import PretrainedConfig, PreTrainedModel
 
 from .configuration_dflash import DFlashConfig
 from .flex_attention import compile_friendly_flex_attention
+from .kernels import DFLASH_ATTENTION_BACKENDS, dflash_sparse_attention
 
 
 class DFlashRMSNorm(nn.Module):
@@ -154,6 +155,10 @@ class DFlashAttention(nn.Module):
         context_position_ids: torch.Tensor,
         block_mask=None,
         dense_attention_mask: Optional[torch.Tensor] = None,
+        attention_backend: str = "auto",
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        block_size: Optional[int] = None,
     ) -> torch.Tensor:
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -188,11 +193,40 @@ class DFlashAttention(nn.Module):
         sin_k = sin[full_position_ids].unsqueeze(1)
         k = (k * cos_k) + (rotate_half(k) * sin_k)
 
-        if block_mask is not None:
+        attention_backend = str(attention_backend or "auto").lower()
+        if attention_backend not in DFLASH_ATTENTION_BACKENDS:
+            raise ValueError(
+                f"Unknown DFlash attention backend {attention_backend!r}; "
+                f"expected one of {sorted(DFLASH_ATTENTION_BACKENDS)}"
+            )
+        if attention_backend in ("triton", "tilelang"):
+            if anchor_positions is None or block_keep_mask is None or block_size is None:
+                raise ValueError(
+                    f"DFlash {attention_backend} attention requires anchors, keep mask, and block size"
+                )
+            if block_mask is not None or dense_attention_mask is not None:
+                raise ValueError(
+                    f"DFlash {attention_backend} attention consumes structural metadata, not a materialized mask"
+                )
+            attn_output = dflash_sparse_attention(
+                q,
+                k,
+                v,
+                anchor_positions,
+                block_keep_mask,
+                ctx_len=ctx_len,
+                block_size=int(block_size),
+                backend=attention_backend,
+            )
+        elif attention_backend == "flex" or (
+            attention_backend == "auto" and block_mask is not None
+        ):
             if dense_attention_mask is not None:
                 raise ValueError(
                     "DFlash attention received both block_mask and dense_attention_mask"
                 )
+            if block_mask is None:
+                raise ValueError("DFlash flex attention requires a block_mask")
             attn_output = compile_friendly_flex_attention(
                 q,
                 k.contiguous(),
@@ -201,6 +235,8 @@ class DFlashAttention(nn.Module):
                 enable_gqa=True,
             )
         else:
+            if attention_backend == "sdpa" and dense_attention_mask is None:
+                raise ValueError("DFlash SDPA attention requires a dense_attention_mask")
             k = repeat_kv(k, self.num_kv_groups)
             v = repeat_kv(v, self.num_kv_groups)
             attn_output = F.scaled_dot_product_attention(
@@ -256,6 +292,10 @@ class DFlashDecoderLayer(nn.Module):
         context_position_ids: torch.Tensor,
         block_mask=None,
         dense_attention_mask: Optional[torch.Tensor] = None,
+        attention_backend: str = "auto",
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        block_size: Optional[int] = None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -266,6 +306,10 @@ class DFlashDecoderLayer(nn.Module):
             context_position_ids=context_position_ids,
             block_mask=block_mask,
             dense_attention_mask=dense_attention_mask,
+            attention_backend=attention_backend,
+            anchor_positions=anchor_positions,
+            block_keep_mask=block_keep_mask,
+            block_size=block_size,
         )
         draft_hidden = residual + draft_hidden
 
@@ -356,6 +400,10 @@ class DFlashDraftModel(PreTrainedModel):
         block_mask=None,
         dense_attention_mask: Optional[torch.Tensor] = None,
         noise_embedding: Optional[torch.Tensor] = None,
+        attention_backend: str = "auto",
+        anchor_positions: Optional[torch.Tensor] = None,
+        block_keep_mask: Optional[torch.Tensor] = None,
+        block_size: Optional[int] = None,
     ) -> torch.Tensor:
         if noise_embedding is not None:
             draft_hidden = noise_embedding.to(context_feature.dtype)
@@ -370,6 +418,10 @@ class DFlashDraftModel(PreTrainedModel):
                 context_position_ids=context_position_ids,
                 block_mask=block_mask,
                 dense_attention_mask=dense_attention_mask,
+                attention_backend=attention_backend,
+                anchor_positions=anchor_positions,
+                block_keep_mask=block_keep_mask,
+                block_size=block_size,
             )
         return self.norm(draft_hidden)
 

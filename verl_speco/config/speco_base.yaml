@@ -99,6 +99,9 @@ actor_rollout_ref:
         ttt_length: 1
         vocab_mapping_path: null
         dflash_block_size: 16
+        # auto preserves CUDA->FlexAttention and non-CUDA->SDPA. Triton and
+        # TileLang are explicit, fail-closed training-only alternatives.
+        dflash_attention_backend: auto
         dflash_num_anchors: 512
         dflash_loss_decay_gamma: 7.0
         dflash_front_position_weight: 1.0

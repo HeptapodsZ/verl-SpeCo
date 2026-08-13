@@ -1,0 +1,780 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DFlash 训练数据准备：old-logprob hidden capture 路径</title>
+  <style>
+    :root {
+      color-scheme: light dark;
+      --bg: light-dark(#f5f7fb, #111827);
+      --surface: light-dark(#ffffff, #182233);
+      --surface-2: light-dark(#f8fafc, #202c3d);
+      --text: light-dark(#172033, #e8eef7);
+      --muted: light-dark(#5c667a, #a9b5c7);
+      --border: light-dark(#d9e0eb, #344359);
+      --accent: light-dark(#3159c4, #8eacff);
+      --accent-soft: light-dark(#eaf0ff, #24345c);
+      --fact: light-dark(#146c43, #7ee2ad);
+      --fact-soft: light-dark(#e6f6ed, #163b2c);
+      --infer: light-dark(#945f00, #ffd27a);
+      --infer-soft: light-dark(#fff4d6, #4a3616);
+      --unknown: light-dark(#9c2f3d, #ff9aa8);
+      --unknown-soft: light-dark(#fdecef, #4c2029);
+      --code: light-dark(#eff3f8, #0d1522);
+      --shadow: light-dark(0 12px 30px rgba(31, 45, 72, 0.08), 0 12px 30px rgba(0, 0, 0, 0.22));
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font-family: Inter, "Noto Sans SC", "Microsoft YaHei", system-ui, sans-serif;
+      line-height: 1.72;
+    }
+
+    main {
+      width: min(1180px, calc(100% - 32px));
+      margin: 0 auto;
+      padding: 42px 0 72px;
+    }
+
+    h1, h2, h3 { line-height: 1.28; }
+    h1 { margin: 0 0 14px; font-size: clamp(1.9rem, 4vw, 3rem); }
+    h2 { margin: 48px 0 18px; font-size: 1.55rem; }
+    h3 { margin: 28px 0 12px; font-size: 1.16rem; }
+    p { margin: 10px 0; }
+
+    a { color: var(--accent); text-decoration-thickness: 1px; text-underline-offset: 3px; }
+    code, pre { font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace; }
+    code { font-size: 0.92em; }
+
+    .hero, .section-card {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 18px;
+      box-shadow: var(--shadow);
+    }
+
+    .hero { padding: clamp(24px, 5vw, 48px); }
+    .eyebrow { color: var(--accent); font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; }
+    .subtitle { max-width: 860px; color: var(--muted); font-size: 1.06rem; }
+
+    .meta-grid, .shape-grid {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+      margin-top: 24px;
+    }
+
+    .meta, .shape-card {
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 14px 16px;
+    }
+
+    .meta strong, .shape-card strong { display: block; margin-bottom: 4px; }
+    .meta span, .shape-card span { color: var(--muted); }
+
+    .toc {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px 16px;
+      margin-top: 22px;
+    }
+
+    .toc a { font-size: 0.94rem; }
+
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin: 20px 0;
+    }
+
+    .tag {
+      display: inline-flex;
+      align-items: center;
+      border-radius: 999px;
+      padding: 2px 9px;
+      font-size: 0.78rem;
+      font-weight: 700;
+      white-space: nowrap;
+    }
+
+    .tag.fact { color: var(--fact); background: var(--fact-soft); }
+    .tag.infer { color: var(--infer); background: var(--infer-soft); }
+    .tag.unknown { color: var(--unknown); background: var(--unknown-soft); }
+
+    .call-stack {
+      margin: 26px 0 0;
+      padding: 0;
+      list-style: none;
+      counter-reset: stack;
+    }
+
+    .call-stack li {
+      position: relative;
+      display: grid;
+      grid-template-columns: 48px minmax(0, 1fr) auto;
+      gap: 14px;
+      align-items: center;
+      padding: 16px 18px;
+      margin-bottom: 28px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      counter-increment: stack;
+    }
+
+    .call-stack li::before {
+      content: counter(stack);
+      display: grid;
+      place-items: center;
+      width: 36px;
+      height: 36px;
+      border-radius: 50%;
+      color: var(--accent);
+      background: var(--accent-soft);
+      font-weight: 800;
+    }
+
+    .call-stack li:not(:last-child)::after {
+      content: "↓";
+      position: absolute;
+      bottom: -29px;
+      left: 31px;
+      color: var(--accent);
+      font-size: 1.35rem;
+      font-weight: 800;
+    }
+
+    .call-stack .symbol { font-weight: 750; overflow-wrap: anywhere; }
+    .call-stack .owner { color: var(--muted); font-size: 0.86rem; text-align: right; }
+    .call-stack .sub { grid-column: 2 / -1; margin-top: -8px; color: var(--muted); font-size: 0.92rem; }
+
+    .section-card { padding: clamp(20px, 4vw, 34px); margin-top: 20px; }
+    .section-card > h3:first-child { margin-top: 0; }
+
+    .role {
+      border-left: 4px solid var(--accent);
+      background: var(--accent-soft);
+      padding: 14px 16px;
+      border-radius: 0 10px 10px 0;
+    }
+
+    .evidence {
+      margin: 16px 0;
+      padding: 14px 16px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface-2);
+    }
+
+    .evidence-head {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: baseline;
+      gap: 8px;
+      margin-bottom: 8px;
+    }
+
+    .source { font-size: 0.88rem; overflow-wrap: anywhere; }
+
+    pre {
+      margin: 10px 0 0;
+      padding: 13px 15px;
+      overflow-x: auto;
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      line-height: 1.55;
+      font-size: 0.86rem;
+    }
+
+    .flow-row {
+      display: grid;
+      grid-template-columns: repeat(7, minmax(0, auto));
+      align-items: center;
+      gap: 8px;
+      margin: 22px 0;
+    }
+
+    .flow-node {
+      min-width: 0;
+      padding: 12px;
+      text-align: center;
+      background: var(--surface-2);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      overflow-wrap: anywhere;
+    }
+
+    .arrow { color: var(--accent); font-weight: 800; text-align: center; }
+
+    .table-wrap { overflow-x: auto; }
+    table { width: 100%; border-collapse: collapse; min-width: 720px; }
+    th, td { padding: 12px 14px; text-align: left; vertical-align: top; border-bottom: 1px solid var(--border); }
+    th { background: var(--surface-2); font-size: 0.88rem; }
+    td { font-size: 0.93rem; }
+
+    .formula {
+      margin: 16px 0;
+      padding: 16px;
+      background: var(--code);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      font-family: "Cascadia Code", Consolas, monospace;
+      overflow-x: auto;
+    }
+
+    .callout {
+      margin: 16px 0;
+      padding: 14px 16px;
+      border-radius: 12px;
+      border: 1px solid var(--border);
+    }
+
+    .callout.fact { background: var(--fact-soft); }
+    .callout.infer { background: var(--infer-soft); }
+    .callout.unknown { background: var(--unknown-soft); }
+
+    .trace {
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(210px, 1fr));
+      gap: 12px;
+    }
+
+    .trace > div {
+      padding: 15px;
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      background: var(--surface-2);
+    }
+
+    .trace .n { color: var(--accent); font-weight: 800; }
+    .trace strong { display: block; margin: 4px 0 6px; }
+
+    footer { margin-top: 44px; color: var(--muted); font-size: 0.9rem; }
+
+    @media (max-width: 760px) {
+      main { width: min(100% - 20px, 1180px); padding-top: 16px; }
+      .hero, .section-card { border-radius: 13px; }
+      .call-stack li { grid-template-columns: 42px minmax(0, 1fr); }
+      .call-stack .owner { grid-column: 2; text-align: left; }
+      .call-stack .sub { grid-column: 2; }
+      .flow-row { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <header class="hero">
+    <div class="eyebrow">VeRL-SpeCo · DFlash · Learn / Explain</div>
+    <h1>DFlash 训练数据准备：old-logprob hidden capture 路径</h1>
+    <p class="subtitle">
+      本文围绕一条主线解释：如何在 actor 的 old-logprob forward 中选择并采集 target model hidden rows，如何把它们恢复成按 rollout 样本组织的数据，再如何对齐出 DFlash 可消费的 <code>ids / h_states / masks</code>。分析范围仅覆盖当前工作区的 old-logprob hidden capture 路径，不把 SGLang rollout capture、EAGLE3 或 DSpark 分支混入结论。
+    </p>
+    <div class="meta-grid">
+      <div class="meta"><strong>源码版本</strong><span>本地提交 <code>7f1e1f7</code>；以当前工作树为准</span></div>
+      <div class="meta"><strong>证据方法</strong><span><code>rg -n</code>、<code>nl -ba</code>、静态调用链核对</span></div>
+      <div class="meta"><strong>运行验证</strong><span>未启动模型训练；本文不声称 GPU / Ray 运行时实测</span></div>
+      <div class="meta"><strong>核心结果</strong><span>默认 513 hidden rows → 514 token/mask slice → 512-row DFlash window</span></div>
+    </div>
+    <nav class="toc" aria-label="目录">
+      <a href="#stack">调用栈</a>
+      <a href="#plan">1. collect plan</a>
+      <a href="#hook">2. forward hook</a>
+      <a href="#collect">3. feature collection</a>
+      <a href="#online">4. online data</a>
+      <a href="#preprocess">5. DFlash preprocess</a>
+      <a href="#trace">端到端 shape trace</a>
+      <a href="#boundaries">证据边界</a>
+    </nav>
+  </header>
+
+  <section id="stack">
+    <h2>一、整体调用过程与调用栈</h2>
+    <p>
+      <span class="tag fact">已验证事实</span>
+      old-logprob 分支先构造采集计划，把计划字段写入无 padding 的 actor batch，再调用 <code>compute_log_prob</code>；forward 返回后，trainer 立即调用 feature collector。
+      <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L2194">证据：speco_ray_trainer.py:2194–2238</a>
+    </p>
+
+    <ol class="call-stack" aria-label="DFlash old-logprob 训练数据准备调用栈">
+      <li>
+        <div class="symbol"><code>_speco_build_oldlogprob_collect_plan(batch)</code></div>
+        <div class="owner">SpecoRayPPOTrainer</div>
+        <div class="sub">选择样本，计算每个样本要采的 source positions，并分配 drafter owner。</div>
+      </li>
+      <li>
+        <div class="symbol">写入 <code>collect_mask / hidden_positions / layer ids / layout</code></div>
+        <div class="owner">SpecoRayPPOTrainer</div>
+        <div class="sub">采集元数据随 old-logprob micro-batch 进入 actor worker。</div>
+      </li>
+      <li>
+        <div class="symbol"><code>actor_rollout_wg.compute_log_prob(batch_td)</code></div>
+        <div class="owner">Ray actor worker group</div>
+        <div class="sub">执行 old-logprob forward；SpeCo runtime patch 在 FSDP engine 的输入/输出边界插入 hidden capture。</div>
+      </li>
+      <li>
+        <div class="symbol"><code>_install_oldlogprob_hidden_hooks → forward hooks → _consume_oldlogprob_hidden_capture</code></div>
+        <div class="owner">oldlogprob_runtime.py</div>
+        <div class="sub">按计划位置选 hidden rows，将多个 target context layer 沿最后一维拼接后放入 old-logprob 输出。</div>
+      </li>
+      <li>
+        <div class="symbol"><code>_speco_collect_oldlogprob_features(batch, plan, output)</code></div>
+        <div class="owner">SpecoRayPPOTrainer</div>
+        <div class="sub">恢复无 padding 的 prompt+response，组装 per-sample payload，并按 owner bucket 发送给 drafter worker。</div>
+      </li>
+      <li>
+        <div class="symbol"><code>collect_rollout_features → _store_rollout_sample → collect_online_data</code></div>
+        <div class="owner">SpecoWorker / DrafterBaseTrainer</div>
+        <div class="sub">解析 tensor 或 Ray ObjectRef，按 hidden positions 对齐 token、hidden、loss mask，并存入当前步列表或 DataBuffer。</div>
+      </li>
+      <li>
+        <div class="symbol"><code>preprocess_individual_items(items, device, model_config)</code></div>
+        <div class="owner">DFlashTrainerBackend</div>
+        <div class="sub">校验 DFlash hidden layout/宽度，取共同有效长度，裁成训练窗口，输出 ids、hidden 和 mask 列表。</div>
+      </li>
+    </ol>
+
+    <div class="evidence">
+      <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>控制流主干</strong></div>
+      <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L2195">speco_ray_trainer.py:2195–2238</a>
+      <pre><code>collect_plan = self._speco_build_oldlogprob_collect_plan(batch)
+...
+output = self.actor_rollout_wg.compute_log_prob(batch_td)
+...
+self._speco_collect_oldlogprob_features(batch, collect_plan, output)</code></pre>
+    </div>
+
+    <div class="flow-row" aria-label="数据对象演化">
+      <div class="flow-node"><code>rollout batch</code><br>prompt + response</div><div class="arrow">→</div>
+      <div class="flow-node"><code>collect_plan</code><br>位置与路由</div><div class="arrow">→</div>
+      <div class="flow-node"><code>captured hidden</code><br>selected rows</div><div class="arrow">→</div>
+      <div class="flow-node"><code>data_item</code><br>aligned slice</div>
+    </div>
+
+    <div class="callout fact">
+      <span class="tag fact">已验证事实</span>
+      这不是一次纯函数式的连续 Python 调用：<code>compute_log_prob</code> 跨 Ray worker group，feature payload 又通过 owner-route RPC 进入 drafter worker。RPC 发起点是
+      <a href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L855">speco_ray_trainer.py:855–866</a>，worker 入口是
+      <a href="../../verl-SpeCo/verl_speco/workers/speco_worker.py#L758">speco_worker.py:758–821</a>。
+    </div>
+  </section>
+
+  <section id="plan">
+    <h2>二、步骤 1：<code>_speco_build_oldlogprob_collect_plan</code></h2>
+    <div class="section-card">
+      <h3>Role（4 句话）</h3>
+      <p class="role">
+        该方法负责判断本 RL step 是否应从 old-logprob forward 采集 DFlash 训练特征。它从 rollout batch 的 attention/response mask 得到每个样本的真实 prompt 与 response 长度，再按采样率、owner 容量和 token 配额筛选样本。对每个入选样本，它生成连续的 <code>hidden_positions</code>，并记录该样本应发送到哪个 drafter owner。它输出的是“采集计划”，不直接生成后续的 <code>ids</code>、<code>hidden_states</code> 或 <code>loss_mask</code>。
+      </p>
+
+      <h3>关键细节 1：启用条件与路径约束</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>old-logprob capture 是 opt-in，且与 SGLang capture / logits 路径互斥</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L868">speco_ray_trainer.py:868–905</a>
+        <pre><code>collect_hidden_states_from_old_logprob
+collect_hidden_states_from_sgl == false
+use_logits == false
+actor.strategy in {"fsdp", "fsdp2"}</code></pre>
+      </div>
+      <p>
+        基础 YAML 默认没有启用该路径，但将 capture 实现预设为 <code>forward_hook</code>：
+        <a href="../../verl-SpeCo/verl_speco/config/speco_base.yaml#L49">speco_base.yaml:49–64</a>。
+      </p>
+
+      <h3>关键细节 2：为什么计划采 513 行而不是 512 行</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong><code>hidden_rows = train_rows + 1</code></strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1147">speco_ray_trainer.py:1147–1154</a>
+        <pre><code>train_rows = self._speco_oldlogprob_window_train_rows(training_cfg)
+hidden_rows = train_rows + 1
+hidden_positions = torch.zeros(batch_size, hidden_rows, dtype=torch.long)</code></pre>
+      </div>
+      <p>
+        <code>train_rows</code> 优先读取 <code>hidden_state_window_tokens_per_sample</code>，未配置时才回退到 <code>hidden_state_window_min_rows</code>；实现见
+        <a href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L949">speco_ray_trainer.py:949–953</a>。基础配置两者均为 512，因此当前默认计划的 <code>R = hidden_rows = 513</code>；配置证据见
+        <a href="../../verl-SpeCo/verl_speco/config/speco_base.yaml#L62">speco_base.yaml:62–64</a>。
+      </p>
+
+      <h3>关键细节 3：样本筛选与位置区间</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>response 少于 R 行的样本不会进入计划</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1180">speco_ray_trainer.py:1180–1208</a>
+        <pre><code>if prompt_len &lt;= 0 or response_len &lt; hidden_rows:
+    continue
+...
+if owner_token_counts[owner] + hidden_rows &gt; max_tokens_per_owner:
+    continue</code></pre>
+      </div>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>front 模式从 prompt 最后一项开始；random 模式在 response 范围内偏移</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1209">speco_ray_trainer.py:1209–1223</a>
+        <pre><code>max_start_offset = max(response_len - hidden_rows, 0)
+random_offset = ... if window_mode == "random" else 0
+start = max(prompt_len - 1, 0) + random_offset
+positions = torch.arange(start, start + hidden_rows)</code></pre>
+      </div>
+      <div class="formula">front 模式：hidden_positions = [p−1, p, …, p+R−2]，shape = [B, R]</div>
+      <p>
+        <span class="tag infer">代码推断</span>
+        从 <code>p−1</code> 开始使 prompt 最后一位置的 hidden row 可以与第一个 response token 的 next-token 关系对齐；这一解释与后续“hidden row p supervises token p+1”的注释一致，但当前代码没有单独的设计文档陈述其算法动机。后续对齐注释见
+        <a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2611">base_trainer.py:2611–2626</a>。
+      </p>
+    </div>
+  </section>
+
+  <section id="hook">
+    <h2>三、步骤 2：old-logprob forward hook</h2>
+    <div class="section-card">
+      <h3>Role（4 句话）</h3>
+      <p class="role">
+        forward hook 的职责是在 actor 本来就要执行的 old-logprob forward 中旁路截取 target model 中间层输出。runtime 根据 collect plan 将样本内序列位置转换为 packed/local tensor 索引，并只保留入选样本的目标 rows。它在配置指定的 target context layers 上注册 hook，forward 结束后把各层结果沿 hidden 维拼接。最终结果被写入 old-logprob 输出；若 ObjectRef 路径可用，还可转换成 Ray 引用以避免把大 tensor 直接嵌入返回对象。
+      </p>
+
+      <h3>关键细节 1：计划元数据如何进入 forward</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>trainer 在 <code>compute_log_prob</code> 前写入四类采集元数据和 layer/layout 设置</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L2204">speco_ray_trainer.py:2204–2227</a>
+        <pre><code>batch_td[COLLECT_MASK] = collect_plan["collect_mask"]
+batch_td[HIDDEN_POSITIONS] = collect_plan["hidden_positions"]
+batch_td[HIDDEN_POSITION_MASK] = collect_plan["hidden_position_mask"]
+batch_td[OWNER_RANK] = collect_plan["owner_rank"]
+# 另附 aux_layer_ids、capture_impl、hidden_layout</code></pre>
+      </div>
+      <p>
+        DFlash-family 的布局解析结果是 <code>dflash_aux</code>，表示训练侧消费 target auxiliary context layers，而非 EAGLE3 的 aux+last 布局；实现见
+        <a href="../../verl-SpeCo/verl_speco/integration/oldlogprob_layer_ids.py#L76">oldlogprob_layer_ids.py:76–93</a>。如果无法从显式 DFlash layer ids、drafter checkpoint 或 target config 解析 layer ids，trainer 会拒绝猜测并抛错；见
+        <a href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1083">speco_ray_trainer.py:1083–1106</a>。
+      </p>
+
+      <h3>关键细节 2：packed position → local hidden row</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>样本内位置先加 packed offset，再换算成本 rank 的 local position</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L758">oldlogprob_runtime.py:758–825</a>
+        <pre><code>seq_start = int(offsets[batch_idx].item())
+seq_pos = int(hidden_positions[batch_idx, row_idx].item())
+global_flat_pos = seq_start + seq_pos
+local_pos = global_flat_pos - rank_start</code></pre>
+      </div>
+      <p>
+        对 3D hidden，runtime 用 <code>hidden[batch_indices, seq_positions]</code>；对 packed 2D hidden，则用 <code>index_select(0, local_positions)</code>。两条分支及输出缓冲区 shape 见
+        <a href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L1030">oldlogprob_runtime.py:1030–1113</a>。
+      </p>
+
+      <h3>关键细节 3：hook 安装、采集与拼接</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>hook 只在要求的 target modules 上注册</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L1505">oldlogprob_runtime.py:1505–1557</a>
+        <pre><code>for key, module in required_modules.items():
+    context["handles"].append(
+        module.register_forward_hook(_make_capture_hook(context, key))
+    )</code></pre>
+      </div>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>每个 hook 按计划选 row；多个 layer 沿最后一维拼接</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L1481">oldlogprob_runtime.py:1481–1487</a>；
+        <a class="source" href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L1359">oldlogprob_runtime.py:1359–1365</a>
+        <pre><code>selected = _select_rows_from_local_hidden(context, module_output)
+...
+selected_rows = torch.cat(selected_items, dim=-1)</code></pre>
+      </div>
+      <p>
+        对单个入选样本，逻辑 hidden shape 因而是 <code>[R, L × Ht]</code>：<code>R</code> 是计划的 hidden rows，<code>L</code> 是 context layer 数，<code>Ht</code> 是 target hidden size。这里的“逻辑 shape”由选 row 输出和 <code>dim=-1</code> 拼接直接推出；dense/compact/SP 返回容器可能额外带 batch 维或稀疏元数据，相关实现见
+        <a href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L1038">oldlogprob_runtime.py:1038–1113</a>、
+        <a href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L1359">oldlogprob_runtime.py:1359–1369</a>。
+      </p>
+
+      <h3>关键细节 4：hook 在 patched FSDP engine 的确切位置</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>输入准备阶段安装，输出准备阶段消费并清理</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L1703">oldlogprob_runtime.py:1703–1769</a>
+        <pre><code>if capture_impl == "forward_hook":
+    _install_oldlogprob_hidden_hooks(...)
+...
+hidden_output = _consume_oldlogprob_hidden_capture(self)
+model_output.update(hidden_output)</code></pre>
+      </div>
+    </div>
+  </section>
+
+  <section id="collect">
+    <h2>四、步骤 3：<code>_speco_collect_oldlogprob_features</code></h2>
+    <div class="section-card">
+      <h3>Role（4 句话）</h3>
+      <p class="role">
+        该方法位于 controller 侧，负责把 old-logprob worker 返回的“按 batch 组织的 hidden 结果”恢复成“按 rollout 样本组织的训练 payload”。它同时兼容直接 tensor、单个 Ray ObjectRef 和 chunked ObjectRefs 三种 hidden 载体。它依据原 batch 的 mask 去掉 prompt/response padding，并把完整 token 序列、hidden positions、layout 和 hidden 数据封装在同一个 sample 中。最后按 collect plan 的 <code>owner_rank</code> 分 bucket，通过 owner-route RPC 送往 drafter workers。
+      </p>
+
+      <h3>关键细节 1：hidden 的三种返回载体</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>collector 明确读取 tensor / refs / chunk refs</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1301">speco_ray_trainer.py:1301–1320</a>
+        <pre><code>hidden_states = tu.get(output, OLD_LOGPROB_HIDDEN_STATES_KEY)
+hidden_refs = ... OLD_LOGPROB_HIDDEN_REFS_KEY
+chunk_refs = ... OLD_LOGPROB_HIDDEN_CHUNK_REFS_KEY
+if hidden_states is None and hidden_refs is None and chunk_refs is None:
+    return 0</code></pre>
+      </div>
+
+      <h3>关键细节 2：重建完整、无 padding 的 rollout token 序列</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>prompt 和 response 分别按 mask 过滤，再拼为 <code>sample_input_ids</code></strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1435">speco_ray_trainer.py:1435–1455</a>
+        <pre><code>prompt_ids = prompts[batch_idx][prompt_mask].detach().cpu()
+response_ids = responses[batch_idx][response_mask].detach().cpu()
+sample_input_ids = torch.cat([prompt_ids, response_ids], dim=0)
+sample = {
+    "input_ids": sample_input_ids.unsqueeze(0),
+    "hidden_positions": valid_positions.detach().cpu().unsqueeze(0),
+}</code></pre>
+      </div>
+      <p>
+        因此，若单样本有效 prompt/response 长度分别为 <code>p/r</code>，此阶段的 <code>sample["input_ids"]</code> shape 是 <code>[1, p+r]</code>；直接 tensor 分支的 hidden 被切到计划行数并加 batch 维，见
+        <a href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1424">speco_ray_trainer.py:1424–1431</a>、
+        <a href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1459">speco_ray_trainer.py:1459–1466</a>。
+      </p>
+
+      <h3>关键细节 3：owner routing 与 worker 解引用</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>sample 按 owner 进入 bucket，然后发出 oldlogprob RPC</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1435">speco_ray_trainer.py:1435–1476</a>
+        <pre><code>owner = int(owner_rank[batch_idx].item())
+buckets[owner].append(sample)
+...
+self._speco_collect_rollout_features_rpc("oldlogprob", buckets)</code></pre>
+      </div>
+      <p>
+        drafter worker 在 <code>collect_rollout_features</code> 中恢复 metadata，并在需要时解析 chunk refs 或普通 ObjectRef；解析后调用 <code>_store_rollout_sample</code>。证据见
+        <a href="../../verl-SpeCo/verl_speco/workers/speco_worker.py#L761">speco_worker.py:761–821</a>。online 模式下，<code>_store_rollout_sample</code> 直接调用 <code>self.trainer.collect_online_data(...)</code>；见
+        <a href="../../verl-SpeCo/verl_speco/workers/speco_worker.py#L474">speco_worker.py:474–489</a>。
+      </p>
+    </div>
+  </section>
+
+  <section id="online">
+    <h2>五、步骤 4：<code>collect_online_data</code></h2>
+    <div class="section-card">
+      <h3>Role（5 句话）</h3>
+      <p class="role">
+        该方法把 worker 收到的 rollout sample 转换为可缓存、可抽样的 drafter training item。它先把 input ids、hidden positions、hidden states 以及 prompt/response 等 tensor 搬到 CPU，以降低长期占用训练设备显存。随后以 <code>hidden_positions</code> 为 source of truth，检查连续性并计算 hidden slice 与 token slice 的共同对齐窗口。它在完整 prompt+response 上构建 response-only loss mask，再用同一个 <code>feature_start:feature_end</code> 切出局部 ids 和 mask。最终 item 被写入跨 step 的 <code>DataBuffer</code> 或当前 step 的 <code>collected_data</code>。
+      </p>
+
+      <h3>关键细节 1：设备搬运与 layout</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>有 copy stream 时使用 non-blocking device→CPU copy</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2384">base_trainer.py:2384–2429</a>
+        <pre><code>hidden_states_layout = batch.get("hidden_states_layout")
+...
+with self.device_module.stream(self.copy_stream):
+    cpu_input_ids = input_ids.to("cpu", non_blocking=True)
+    cpu_h_states = hidden_states.to("cpu", non_blocking=True)</code></pre>
+      </div>
+      <p>
+        <span class="tag infer">代码推断</span>
+        这一路径意图减少主训练/rollout stream 的同步等待，但仅凭 <code>non_blocking=True</code> 与独立 stream 不能证明传输一定与计算重叠；是否真正重叠取决于源 tensor、host memory、后续同步和运行时调度，当前没有 profiler 证据。
+      </p>
+
+      <h3>关键细节 2：连续 positions 与 H+1 token 对齐</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>非连续 positions 会在第一个断点截断</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2513">base_trainer.py:2513–2560</a>
+        <pre><code>contiguous_mask = hidden_positions_item[1:] == hidden_positions_item[:-1] + 1
+if ... not bool(contiguous_mask.all()):
+    selected_hidden_row_end = first_break</code></pre>
+      </div>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>H 行 hidden 对齐 H+1 个 token</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2611">base_trainer.py:2611–2626</a>
+        <pre><code># Hidden row p supervises token p+1 ...
+hidden_feature_length = max_hidden_rows
+feature_start = hidden_position_start
+feature_end = min(input_seq_length,
+                  feature_start + hidden_feature_length + 1)</code></pre>
+      </div>
+      <div class="formula">若保留 H 行 hidden：hidden slice = [H, D]；token slice = [H+1]（输入足够长时）</div>
+
+      <h3>关键细节 3：response-only loss mask</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>完整 mask 初始为 0，只把非 padding response 区域置 1</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2691">base_trainer.py:2691–2713</a>
+        <pre><code>full_loss_mask = torch.zeros(input_seq_length, dtype=torch.float32)
+response_mask = (cpu_responses[i, :response_len] != pad_id).float()
+full_loss_mask[prompt_len : prompt_len + response_len] = response_mask</code></pre>
+      </div>
+
+      <h3>关键细节 4：形成 training item 并存储</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>ids、hidden 和 mask 在这里第一次成为同一 training item 的字段</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2858">base_trainer.py:2858–2874</a>
+        <pre><code>data_item = {
+    "input_ids": cpu_input_ids[i, feature_start:feature_end],
+    "hidden_states": cpu_h_states[i, hidden_start:hidden_end, :],
+    "loss_mask": full_loss_mask[feature_start:feature_end],
+    "hidden_positions": kept_hidden_positions,
+}</code></pre>
+      </div>
+      <p>
+        <code>use_data_buffer=true</code> 时 item 进入跨 step buffer，否则打上当前 RL step 并追加到 <code>collected_data</code>；见
+        <a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L3076">base_trainer.py:3076–3083</a>。训练 batch 准备阶段会从两者之一选样本、过滤掉没有 hidden 的 item，再调用 backend 预处理；见
+        <a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L3314">base_trainer.py:3314–3387</a>。
+      </p>
+    </div>
+  </section>
+
+  <section id="preprocess">
+    <h2>六、步骤 5：<code>preprocess_individual_items</code></h2>
+    <div class="section-card">
+      <h3>Role（4 句话）</h3>
+      <p class="role">
+        该方法是通用 collection item 到 DFlash backend 输入之间的最后一层 per-sample 预处理。它把 token、hidden 和 loss mask 搬到 DFlash 训练设备，并强制验证 hidden layout 与 target context hidden 宽度。它将三者截到共同有效长度，然后围绕第一个 loss-active response 位置裁出不超过 <code>dflash_max_window</code> 的窗口。返回值是三个列表：<code>ids</code>、<code>h_states</code> 和 <code>masks</code>，供后续 per-sample chunk/packing 逻辑使用。
+      </p>
+
+      <h3>关键细节 1：layout 与 hidden width 是 fail-closed 校验</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>DFlash 只接受 <code>None</code> 或 <code>dflash_aux</code></strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1052">dflash_trainer_backend.py:1052–1092</a>
+        <pre><code>expected_hidden_dim = h_dim * num_context_layers
+if layout not in (None, "dflash_aux"):
+    raise ValueError(...)
+...
+if layout == "dflash_aux" and full_h.size(-1) != expected_hidden_dim:
+    raise ValueError(...)</code></pre>
+      </div>
+      <p>
+        <code>ids</code> 直接来自 <code>item["input_ids"]</code>；<code>full_h</code> 来自 <code>item["hidden_states"]</code>，若是 list/tuple 则沿最后一维拼接，并转成 BF16。对应代码见
+        <a href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1077">dflash_trainer_backend.py:1077–1082</a>。
+      </p>
+
+      <h3>关键细节 2：优先使用上一步已经生成的 loss mask</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>标准 old-logprob 路径进入第一个分支</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1094">dflash_trainer_backend.py:1094–1107</a>
+        <pre><code>if item.get("loss_mask") is not None:
+    item_loss_mask = item["loss_mask"].to(device, dtype=torch.float32)
+elif "prompts" in item and "responses" in item:
+    # fallback reconstruction
+else:
+    item_loss_mask[:] = 1.0</code></pre>
+      </div>
+      <p>
+        “标准 old-logprob 路径进入第一个分支”是由 <code>collect_online_data</code> 无条件写入 <code>data_item["loss_mask"]</code> 得出的当前实现事实，写入点见
+        <a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2858">base_trainer.py:2858–2867</a>。后两个分支是对其他/旧数据来源的兼容 fallback，不应误解为本路径每次都重新计算 mask。
+      </p>
+
+      <h3>关键细节 3：为什么取三者最小长度</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>代码只保留 token、hidden、mask 的公共前缀</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1108">dflash_trainer_backend.py:1108–1111</a>
+        <pre><code>valid_len = min(ids.size(0), full_h.size(0), item_loss_mask.size(0))
+ids = ids[:valid_len]
+full_h = full_h[:valid_len]
+item_loss_mask = item_loss_mask[:valid_len]</code></pre>
+      </div>
+      <p>
+        <span class="tag infer">代码推断</span>
+        取最小值的直接效果是防止后续逐 row 组合时任一 tensor 越界，并建立共同的行数不变量；代码未附带“为何选择截断而非报错/补齐”的设计说明。对当前正常 old-logprob 样本，进入此处通常是 <code>ids=[H+1]</code>、<code>full_h=[H,D]</code>、<code>mask=[H+1]</code>，所以公共长度是 <code>H</code>；这一 shape 由
+        <a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2611">base_trainer.py:2611–2626</a> 的 <code>+1</code> token window 与
+        <a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2858">base_trainer.py:2858–2863</a> 的切片共同推出。
+      </p>
+
+      <h3>关键细节 4：围绕首个 response loss row 裁窗</h3>
+      <div class="evidence">
+        <div class="evidence-head"><span class="tag fact">已验证事实</span><strong>窗口以第一个非零 mask 为参照，并受 <code>dflash_max_window</code> 限制</strong></div>
+        <a class="source" href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1053">dflash_trainer_backend.py:1053–1057</a>；
+        <a class="source" href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1112">dflash_trainer_backend.py:1112–1126</a>
+        <pre><code>r_start = nonzero[0, 0]
+start = clamp(r_start - max_window // 2,
+              0, ids.size(0) - max_window)
+end = min(start + max_window, ids.size(0))
+res["ids"].append(ids[start:end])
+res["h_states"].append(full_h[start:end, :expected_hidden_dim])</code></pre>
+      </div>
+      <p>
+        基础配置的 <code>dflash_max_window</code> 是 512，见
+        <a href="../../verl-SpeCo/verl_speco/config/speco_base.yaml#L108">speco_base.yaml:108–115</a>。预处理结果随后被读取为 <code>ids_list / hidden_list / mask_list</code>，进入 DFlash 的 per-sample chunk/packing 阶段；见
+        <a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L3395">base_trainer.py:3395–3424</a>。
+      </p>
+    </div>
+  </section>
+
+  <section id="trace">
+    <h2>七、端到端数据与 shape trace</h2>
+    <p>以下 trace 采用当前基础配置：front window、<code>hidden_state_window_tokens_per_sample=512</code>、<code>dflash_max_window=512</code>。设单样本有效 prompt/response 长度为 <code>p/r</code>，target hidden size 为 <code>Ht</code>，DFlash context layer 数为 <code>L</code>。</p>
+
+    <div class="trace">
+      <div><span class="n">1</span><strong>rollout batch</strong><code>prompts [B,P]</code><br><code>responses [B,Rmax]</code><br><span>真实长度从 mask 求和。</span></div>
+      <div><span class="n">2</span><strong>collect plan</strong><code>hidden_positions [B,513]</code><br><code>[p−1, …, p+511]</code><br><span>要求 <code>r ≥ 513</code>。</span></div>
+      <div><span class="n">3</span><strong>hook output</strong><code>hidden [513,L×Ht]</code><br><span>选 row 后，多层沿最后一维拼接。</span></div>
+      <div><span class="n">4</span><strong>collector sample</strong><code>input_ids [1,p+r]</code><br><code>hidden [1,513,L×Ht]</code><br><span>prompt/response 已去 padding。</span></div>
+      <div><span class="n">5</span><strong>online data item</strong><code>input_ids [514]</code><br><code>hidden [513,L×Ht]</code><br><code>loss_mask [514]</code></div>
+      <div><span class="n">6</span><strong>common prefix</strong><code>ids [513]</code><br><code>full_h [513,L×Ht]</code><br><code>mask [513]</code></div>
+      <div><span class="n">7</span><strong>DFlash window</strong><code>ids [≤512]</code><br><code>h_states [≤512,L×Ht]</code><br><code>masks [≤512]</code></div>
+    </div>
+
+    <div class="shape-grid">
+      <div class="shape-card"><strong>513 的来源</strong><span><code>train_rows + 1</code>；<a href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1147">speco_ray_trainer.py:1147–1152</a></span></div>
+      <div class="shape-card"><strong>514 的来源</strong><span><code>hidden_feature_length + 1</code>；<a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2620">base_trainer.py:2620–2626</a></span></div>
+      <div class="shape-card"><strong>再回到 513</strong><span>三者公共长度；<a href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1108">dflash_trainer_backend.py:1108–1111</a></span></div>
+      <div class="shape-card"><strong>最终 512</strong><span><code>dflash_max_window</code> 裁窗；<a href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1112">dflash_trainer_backend.py:1112–1126</a></span></div>
+    </div>
+
+    <div class="callout infer">
+      <span class="tag infer">代码推断</span>
+      对默认 front window，局部 token slice 从原序列位置 <code>p−1</code> 开始；完整 loss mask 在 prompt 区域为 0、response 区域为 1，因此局部 mask 通常以 <code>[0,1,1,…]</code> 开头。第一个非零位置通常是 1，512 窗口的 <code>start</code> 会 clamp 到 0，所以默认正常样本最终取公共 513 行中的前 512 行。该结论依赖“response 无内部 padding、front 模式、有效长度足够”三个条件；mask 构造见
+      <a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2695">base_trainer.py:2695–2705</a>，裁窗公式见
+      <a href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1112">dflash_trainer_backend.py:1112–1122</a>。
+    </div>
+
+    <h3>三个最终变量的血缘</h3>
+    <div class="table-wrap">
+      <table>
+        <thead><tr><th>DFlash 局部变量</th><th>直接来源</th><th>上游决定因素</th><th>关键证据</th></tr></thead>
+        <tbody>
+          <tr><td><code>ids</code></td><td><code>item["input_ids"]</code></td><td>原 rollout 的 prompt+response；第一个 hidden position 决定局部 <code>feature_start</code></td><td><a href="../../verl-SpeCo/verl_speco/trainer/speco_ray_trainer.py#L1443">collector:1443–1449</a><br><a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2623">online:2623–2626</a><br><a href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1077">backend:1077</a></td></tr>
+          <tr><td><code>full_h</code></td><td><code>item["hidden_states"]</code></td><td>collect mask、hidden positions、target layer ids 和 hidden layout</td><td><a href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L1481">hook:1481–1486</a><br><a href="../../verl-SpeCo/verl_speco/integration/oldlogprob_runtime.py#L1359">concat:1359–1365</a><br><a href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1078">backend:1078–1082</a></td></tr>
+          <tr><td><code>item_loss_mask</code></td><td><code>item["loss_mask"]</code></td><td>prompt/response 边界、response padding，以及与 ids 相同的 feature slice</td><td><a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2695">mask:2695–2713</a><br><a href="../../verl-SpeCo/verl_speco/trainer/base_trainer.py#L2863">slice:2863</a><br><a href="../../verl-SpeCo/verl_speco/backends/dflash_trainer_backend.py#L1094">backend:1094–1097</a></td></tr>
+        </tbody>
+      </table>
+    </div>
+  </section>
+
+  <section id="boundaries">
+    <h2>八、事实、推断与尚未验证的边界</h2>
+    <div class="section-card">
+      <div class="callout fact">
+        <span class="tag fact">已验证事实</span>
+        本文的调用边、分支条件、字段来源、切片公式和默认配置值，均由上面所引当前本地源码逐行核对。特别是 513、514、513、512 四个阶段数值分别来自不同代码点，不能互相替代。
+      </div>
+      <div class="callout infer">
+        <span class="tag infer">代码推断</span>
+        <code>p−1</code> anchor、H+1 token slice 和最小公共前缀共同表达 next-token 对齐与安全截断，这是依据数据流和代码注释作出的解释。源码明确给出行为，但没有在该调用链附近给出完整的 DFlash 算法设计证明。
+      </div>
+      <div class="callout unknown">
+        <span class="tag unknown">当前证据不足</span>
+        未运行真实 old-logprob forward，因此没有动态证明特定模型、特定 FSDP/SP 拓扑下的实际 dtype、物理 stride、ObjectRef 传输量、异步 copy 重叠程度或最终吞吐。也没有证据证明默认 512 是所有模型/数据分布的最优窗口；这需要配置固定的端到端训练测量。
+      </div>
+
+      <h3>建议的自检问题</h3>
+      <ol>
+        <li>若 <code>p=100</code>、front 模式且计划 513 行，<code>hidden_positions</code> 的首尾位置分别是什么？</li>
+        <li>为什么 <code>collect_online_data</code> 为 513 行 hidden 保留 514 个 token，而 backend 又先截成 513 行？</li>
+        <li><code>owner_rank</code> 改变的是样本内容，还是样本被哪个 drafter worker 消费？请指出对应调用点。</li>
+        <li>若改成 random window，哪些公式不变，哪些 source positions 会改变？</li>
+      </ol>
+    </div>
+  </section>
+
+  <footer>
+    文档生成日期：2026-08-12。分析对象：VeRL-SpeCo overlay 的 old-logprob hidden capture → DFlash online training data path；上游 VeRL FSDP engine 通过 SpeCo runtime patch 被接入，但本文未把本地 <code>verl/</code> 代码归因为 SpeCo 原生实现。
+  </footer>
+</main>
+</body>
+</html>

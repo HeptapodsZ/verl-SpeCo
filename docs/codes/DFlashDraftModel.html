@@ -1,0 +1,938 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>DFlashDraftModel：模型结构与 Forward 调用链</title>
+  <style>
+    :root {
+      --bg: #f5f7fb;
+      --paper: #ffffff;
+      --ink: #172033;
+      --muted: #61708a;
+      --line: #dbe2ee;
+      --accent: #3157c8;
+      --accent-soft: #eef2ff;
+      --green: #147d64;
+      --green-soft: #eaf8f4;
+      --orange: #a65b16;
+      --orange-soft: #fff5e8;
+      --red: #a33a3a;
+      --red-soft: #fff0f0;
+      --code-bg: #111827;
+      --code-ink: #e5edf9;
+      --shadow: 0 10px 30px rgba(31, 42, 68, 0.08);
+    }
+
+    * { box-sizing: border-box; }
+
+    html { scroll-behavior: smooth; }
+
+    body {
+      margin: 0;
+      color: var(--ink);
+      background: var(--bg);
+      font-family: Inter, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      line-height: 1.72;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+
+    .page {
+      width: min(1180px, calc(100% - 32px));
+      margin: 28px auto 56px;
+    }
+
+    header,
+    section,
+    .toc {
+      background: var(--paper);
+      border: 1px solid var(--line);
+      border-radius: 16px;
+      box-shadow: var(--shadow);
+    }
+
+    header {
+      padding: 34px 38px;
+      background: linear-gradient(135deg, #ffffff 0%, #eef2ff 100%);
+    }
+
+    h1, h2, h3, h4 { line-height: 1.3; }
+    h1 { margin: 0 0 10px; font-size: clamp(28px, 4vw, 43px); }
+    h2 { margin: 0 0 20px; font-size: 27px; }
+    h3 { margin: 30px 0 12px; font-size: 21px; }
+    h4 { margin: 22px 0 8px; font-size: 17px; }
+    p { margin: 10px 0; }
+
+    .subtitle {
+      margin: 0;
+      color: var(--muted);
+      font-size: 17px;
+    }
+
+    .meta {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      margin-top: 22px;
+    }
+
+    .pill {
+      display: inline-flex;
+      align-items: center;
+      padding: 5px 11px;
+      border-radius: 999px;
+      color: #35425a;
+      background: rgba(255, 255, 255, 0.8);
+      border: 1px solid var(--line);
+      font-size: 13px;
+    }
+
+    .toc {
+      margin-top: 18px;
+      padding: 20px 28px;
+    }
+
+    .toc strong { display: block; margin-bottom: 8px; }
+    .toc ol {
+      margin: 0;
+      padding-left: 22px;
+      columns: 2;
+      column-gap: 36px;
+    }
+
+    section {
+      margin-top: 18px;
+      padding: 30px 36px;
+    }
+
+    .cards {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 14px;
+      margin: 18px 0;
+    }
+
+    .card {
+      border: 1px solid var(--line);
+      border-radius: 12px;
+      padding: 16px;
+      background: #fbfcff;
+    }
+
+    .card strong { display: block; margin-bottom: 4px; }
+    .card p { color: var(--muted); margin: 0; font-size: 14px; }
+
+    .callout {
+      margin: 18px 0;
+      padding: 15px 18px;
+      border-left: 4px solid var(--accent);
+      border-radius: 8px;
+      background: var(--accent-soft);
+    }
+
+    .callout.green { border-color: var(--green); background: var(--green-soft); }
+    .callout.orange { border-color: var(--orange); background: var(--orange-soft); }
+    .callout.red { border-color: var(--red); background: var(--red-soft); }
+
+    .callout strong { display: block; margin-bottom: 4px; }
+
+    code {
+      font-family: "Cascadia Code", "SFMono-Regular", Consolas, monospace;
+      font-size: 0.92em;
+    }
+
+    :not(pre) > code {
+      padding: 2px 5px;
+      border: 1px solid #dce3f0;
+      border-radius: 5px;
+      background: #f3f6fb;
+    }
+
+    pre {
+      overflow-x: auto;
+      margin: 13px 0;
+      padding: 16px 18px;
+      color: var(--code-ink);
+      background: var(--code-bg);
+      border-radius: 10px;
+      line-height: 1.55;
+      tab-size: 4;
+    }
+
+    .source {
+      margin-top: 8px;
+      color: var(--muted);
+      font-size: 13px;
+    }
+
+    .source code { color: #40506a; }
+
+    .tree {
+      white-space: pre;
+      color: var(--code-ink);
+      background: var(--code-bg);
+      border-radius: 10px;
+      padding: 18px;
+      overflow-x: auto;
+      font-family: "Cascadia Code", Consolas, monospace;
+      line-height: 1.6;
+    }
+
+    .flow {
+      display: grid;
+      grid-template-columns: repeat(5, minmax(130px, 1fr));
+      gap: 24px;
+      margin: 22px 0 8px;
+      align-items: stretch;
+    }
+
+    .flow-step {
+      position: relative;
+      min-height: 122px;
+      padding: 14px;
+      border: 1px solid #cdd7eb;
+      border-radius: 12px;
+      background: #f9fbff;
+    }
+
+    .flow-step:not(:last-child)::after {
+      content: "→";
+      position: absolute;
+      right: -22px;
+      top: 42%;
+      color: var(--accent);
+      font-size: 24px;
+      font-weight: 700;
+    }
+
+    .flow-step b { display: block; margin-bottom: 5px; color: var(--accent); }
+    .flow-step small { display: block; color: var(--muted); line-height: 1.5; }
+
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      margin: 16px 0;
+      font-size: 14px;
+    }
+
+    th, td {
+      padding: 11px 12px;
+      border: 1px solid var(--line);
+      text-align: left;
+      vertical-align: top;
+    }
+
+    th { background: #f2f5fb; }
+    tbody tr:nth-child(even) { background: #fbfcfe; }
+
+    .evidence {
+      margin: 16px 0 24px;
+      border: 1px solid #cad5eb;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+
+    .evidence-head {
+      display: flex;
+      justify-content: space-between;
+      gap: 16px;
+      padding: 11px 15px;
+      background: #edf2fb;
+      border-bottom: 1px solid #cad5eb;
+      font-size: 13px;
+    }
+
+    .evidence-head strong { color: #293b66; }
+    .evidence pre { margin: 0; border-radius: 0; }
+
+    .two-col {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    .matrix {
+      display: grid;
+      grid-template-columns: 120px 1fr;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+      overflow: hidden;
+      margin: 16px 0;
+    }
+
+    .matrix > div { padding: 11px 13px; border-bottom: 1px solid var(--line); }
+    .matrix > div:nth-child(odd) { background: #f3f6fb; font-weight: 700; }
+    .matrix > div:nth-last-child(-n+2) { border-bottom: 0; }
+
+    footer {
+      margin-top: 18px;
+      padding: 20px 8px;
+      color: var(--muted);
+      text-align: center;
+      font-size: 13px;
+    }
+
+    @media (max-width: 900px) {
+      .cards, .two-col { grid-template-columns: 1fr; }
+      .flow { grid-template-columns: 1fr; gap: 12px; }
+      .flow-step:not(:last-child)::after {
+        content: "↓";
+        top: auto;
+        right: 50%;
+        bottom: -24px;
+      }
+      .toc ol { columns: 1; }
+    }
+
+    @media print {
+      body { background: white; }
+      .page { width: 100%; margin: 0; }
+      header, section, .toc { box-shadow: none; break-inside: avoid; }
+      a { color: inherit; }
+    }
+  </style>
+</head>
+<body>
+  <main class="page">
+    <header>
+      <h1>DFlashDraftModel：模型结构与 Forward 调用链</h1>
+      <p class="subtitle">以 VeRL-SpeCo 本地源码为唯一事实依据，明确区分裸模型、训练包装器、frozen target head 与 loss 边界。</p>
+      <div class="meta">
+        <span class="pill">文档日期：2026-08-11</span>
+        <span class="pill">VeRL baseline：release/v0.8.0</span>
+        <span class="pill">对象：DFlashDraftModel</span>
+        <span class="pill">路径：verl_speco/models/dflash/modeling_dflash.py</span>
+      </div>
+    </header>
+
+    <nav class="toc" aria-label="目录">
+      <strong>目录</strong>
+      <ol>
+        <li><a href="#conclusion">先给结论</a></li>
+        <li><a href="#boundary">对象边界与调用入口</a></li>
+        <li><a href="#structure">模型结构</a></li>
+        <li><a href="#contract">Forward 输入输出契约</a></li>
+        <li><a href="#forward">Forward 完整链路</a></li>
+        <li><a href="#attention">Dual-source attention</a></li>
+        <li><a href="#tensor-trace">张量形状追踪</a></li>
+        <li><a href="#evidence-index">代码证据索引</a></li>
+        <li><a href="#why">What / How / Why</a></li>
+      </ol>
+    </nav>
+
+    <section id="conclusion">
+      <h2>1. 先给结论</h2>
+      <div class="cards">
+        <article class="card">
+          <strong>它是什么</strong>
+          <p>一个接收 target 多层 hidden states 作为 context，并对若干 draft block 产生 hidden representation 的轻量 Transformer。</p>
+        </article>
+        <article class="card">
+          <strong>它输出什么</strong>
+          <p><code>DFlashDraftModel.forward()</code> 只返回 draft hidden states；它不负责 target-head logits，也不直接计算 CE loss。</p>
+        </article>
+        <article class="card">
+          <strong>训练入口在哪里</strong>
+          <p>外层 <code>DFlashTrainingModel.forward()</code> 负责 context 投影、anchor/noise/mask、labels 和 loss，并调用裸模型。</p>
+        </article>
+      </div>
+
+      <div class="callout red">
+        <strong>最重要的边界</strong>
+        <code>DFlashDraftModel</code> 不是完整的训练 loss module。实际训练对象是
+        <code>DFlashTrainingModel(draft_model=DFlashDraftModel)</code>；frozen target
+        <code>lm_head</code> 由 <code>DFlashTrainerBackend</code> 单独持有。
+      </div>
+    </section>
+
+    <section id="boundary">
+      <h2>2. 对象边界与调用入口</h2>
+
+      <div class="tree">DrafterBaseTrainer
+├── backend: DFlashTrainerBackend
+│   └── target_lm_head               # frozen；不属于 DFlashDraftModel
+├── model: FSDP2(DFlashTrainingModel)
+│   └── draft_model: DFlashDraftModel
+├── optimizer: AdamW
+└── lr_scheduler</div>
+
+      <p>Build 时，backend 先实例化裸 <code>DFlashDraftModel</code>，随后把它包进训练专用的
+        <code>DFlashTrainingModel</code>。因此 FSDP 和 optimizer 面向的是外层训练包装器。</p>
+
+      <div class="evidence">
+        <div class="evidence-head">
+          <strong>Evidence A：backend 返回训练包装器，而不是裸模型</strong>
+          <span><code>verl_speco/backends/dflash_trainer_backend.py:975-1003</code></span>
+        </div>
+        <pre><code>draft_model = DFlashDraftModel(deepcopy(drafter_config))
+...
+return DFlashTrainingModel(
+    draft_model=draft_model,
+    block_size=...,
+    num_anchors=...,
+    loss_mode=...,
+), drafter_config</code></pre>
+      </div>
+
+      <p>训练 forward 的直接调用链是：</p>
+      <pre><code>DrafterBaseTrainer._training_step_on_batch()
+└── DFlashTrainerBackend.compute_loss(model, batch, pad_size)
+    └── FSDP2(DFlashTrainingModel).forward(...)
+        ├── DFlashDraftModel.extract_context_feature(...)
+        └── DFlashDraftModel.forward(...)
+            └── DFlashDecoderLayer.forward(...)</code></pre>
+
+      <div class="evidence">
+        <div class="evidence-head">
+          <strong>Evidence B：backend 拆分 target layers 后调用外层 model</strong>
+          <span><code>verl_speco/backends/dflash_trainer_backend.py:1132-1144</code></span>
+        </div>
+        <pre><code>draft_model = model.module if hasattr(model, "module") else model
+hidden_states = batch["hidden_states"]
+num_context_layers = draft_model.draft_model.num_context_layers
+per_layer_dim = hidden_states.shape[-1] // num_context_layers
+hidden_states_list = list(hidden_states.split(per_layer_dim, dim=-1))
+
+loss, ... = model(
+    input_ids=batch["input_ids"],
+    hidden_states_list=hidden_states_list,
+    loss_mask=batch["loss_mask"],
+    lm_head_weight=self.target_lm_head.fc.weight,
+)</code></pre>
+      </div>
+    </section>
+
+    <section id="structure">
+      <h2>3. DFlashDraftModel 模型结构</h2>
+
+      <div class="tree">DFlashDraftModel (PreTrainedModel)
+├── fc: Linear(C × Ht → Hd, bias=False)
+├── hidden_norm: DFlashRMSNorm(Hd)
+├── embed_tokens: Embedding(V, Hd)              # build 后被冻结
+├── layers: ModuleList[N]
+│   └── DFlashDecoderLayer
+│       ├── input_layernorm: DFlashRMSNorm(Hd)
+│       ├── self_attn: DFlashAttention
+│       │   ├── q_proj: Linear(Hd → Nq × Dh)
+│       │   ├── k_proj: Linear(Hd → Nkv × Dh)
+│       │   ├── v_proj: Linear(Hd → Nkv × Dh)
+│       │   ├── o_proj: Linear(Nq × Dh → Hd)
+│       │   ├── q_norm: DFlashRMSNorm(Dh)
+│       │   ├── k_norm: DFlashRMSNorm(Dh)
+│       │   └── rotary_emb: DFlashRotaryEmbedding(Dh)
+│       ├── post_attention_layernorm: DFlashRMSNorm(Hd)
+│       └── mlp: DFlashMLP
+│           ├── gate_proj: Linear(Hd → Hi)
+│           ├── up_proj: Linear(Hd → Hi)
+│           └── down_proj: Linear(Hi → Hd)
+└── norm: DFlashRMSNorm(Hd)</div>
+
+      <p>符号约定：</p>
+      <table>
+        <thead>
+          <tr><th>符号</th><th>含义</th><th>配置字段</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>B</code></td><td>训练 batch size</td><td><code>batch_size_per_gpu</code>，示例脚本为 4</td></tr>
+          <tr><td><code>C</code></td><td>选取的 target context layer 数</td><td><code>num_context_layers</code>，默认 5</td></tr>
+          <tr><td><code>Ht</code></td><td>target model hidden size</td><td><code>target_hidden_size</code></td></tr>
+          <tr><td><code>Hd</code></td><td>drafter hidden size</td><td><code>hidden_size</code></td></tr>
+          <tr><td><code>Hi</code></td><td>drafter MLP intermediate size</td><td><code>intermediate_size</code></td></tr>
+          <tr><td><code>N</code></td><td>drafter decoder 层数</td><td><code>num_hidden_layers</code>，默认 1</td></tr>
+          <tr><td><code>Nq/Nkv</code></td><td>query heads / key-value heads</td><td><code>num_attention_heads</code> / <code>num_key_value_heads</code></td></tr>
+          <tr><td><code>Dh</code></td><td>head dimension</td><td><code>head_dim</code> 或 <code>Hd / Nq</code></td></tr>
+          <tr><td><code>V</code></td><td>词表大小</td><td><code>vocab_size</code></td></tr>
+        </tbody>
+      </table>
+
+      <div class="evidence">
+        <div class="evidence-head">
+          <strong>Evidence C：顶层模块定义</strong>
+          <span><code>verl_speco/models/dflash/modeling_dflash.py:286-338</code></span>
+        </div>
+        <pre><code>self.fc = nn.Linear(
+    self.num_context_layers * self.target_hidden_size,
+    self.hidden_size,
+    bias=False,
+)
+self.hidden_norm = DFlashRMSNorm(self.hidden_size, eps=config.rms_norm_eps)
+self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
+self.layers = nn.ModuleList(
+    [DFlashDecoderLayer(config) for _ in range(self.num_layers)]
+)
+self.norm = DFlashRMSNorm(config.hidden_size, eps=config.rms_norm_eps)</code></pre>
+      </div>
+
+      <div class="two-col">
+        <div>
+          <h3>3.1 Context projection</h3>
+          <p><code>extract_context_feature()</code> 要求输入列表长度严格等于 <code>C</code>。先沿最后一维拼接，再通过
+            <code>fc + RMSNorm</code> 压缩到 drafter hidden size。</p>
+          <pre><code>C × [B, Lc, Ht]
+  → concat
+[B, Lc, C×Ht]
+  → fc + hidden_norm
+[B, Lc, Hd]</code></pre>
+          <p class="source">证据：<code>modeling_dflash.py:340-348</code></p>
+        </div>
+        <div>
+          <h3>3.2 Token embedding</h3>
+          <p>裸模型同时支持两种 draft 输入：</p>
+          <ul>
+            <li>已有 <code>noise_embedding</code>：训练路径直接使用；</li>
+            <li>否则使用 <code>embed_tokens(draft_input_ids)</code>。</li>
+          </ul>
+          <p>Build 阶段 embedding 从 target checkpoint 加载并被冻结。</p>
+          <p class="source">证据：<code>modeling_dflash.py:360-363, 376-400</code></p>
+        </div>
+      </div>
+
+      <h3>3.3 Decoder layer：Pre-Norm + 两次残差</h3>
+      <pre><code>x = draft_hidden
+x = x + Attention(RMSNorm(x), context_hidden)
+x = x + MLP(RMSNorm(x))</code></pre>
+
+      <div class="evidence">
+        <div class="evidence-head">
+          <strong>Evidence D：Decoder layer 的残差结构</strong>
+          <span><code>verl_speco/models/dflash/modeling_dflash.py:251-275</code></span>
+        </div>
+        <pre><code>residual = draft_hidden
+draft_hidden = self.input_layernorm(draft_hidden)
+draft_hidden = self.self_attn(...)
+draft_hidden = residual + draft_hidden
+
+residual = draft_hidden
+draft_hidden = self.post_attention_layernorm(draft_hidden)
+draft_hidden = self.mlp(draft_hidden)
+return residual + draft_hidden</code></pre>
+      </div>
+
+      <h3>3.4 MLP：SwiGLU 形式</h3>
+      <p>MLP 使用 <code>SiLU(gate_proj(x)) * up_proj(x)</code>，再经 <code>down_proj</code> 返回 hidden size。</p>
+      <pre><code>down_proj(silu(gate_proj(x)) * up_proj(x))</code></pre>
+      <p class="source">证据：<code>verl_speco/models/dflash/modeling_dflash.py:222-236</code></p>
+    </section>
+
+    <section id="contract">
+      <h2>4. Forward 输入输出契约</h2>
+
+      <table>
+        <thead>
+          <tr><th>参数</th><th>典型形状</th><th>作用</th><th>训练路径是否使用</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td><code>draft_input_ids</code></td>
+            <td><code>[B, Ld]</code></td>
+            <td>未提供 noise embedding 时，用它查询 drafter embedding。</td>
+            <td>否；训练传 <code>None</code></td>
+          </tr>
+          <tr>
+            <td><code>context_feature</code></td>
+            <td><code>[B, Lc, Hd]</code></td>
+            <td>由 target 多层 hidden states 投影得到，作为 attention 的 context KV 来源。</td>
+            <td>是</td>
+          </tr>
+          <tr>
+            <td><code>draft_position_ids</code></td>
+            <td><code>[B, Ld]</code></td>
+            <td>draft query 和 draft KV 的 RoPE 位置。</td>
+            <td>是</td>
+          </tr>
+          <tr>
+            <td><code>context_position_ids</code></td>
+            <td><code>[B, Lc]</code></td>
+            <td>target context KV 的 RoPE 位置。</td>
+            <td>是</td>
+          </tr>
+          <tr>
+            <td><code>block_mask</code></td>
+            <td>FlexAttention BlockMask</td>
+            <td>CUDA 路径的结构化可见性约束。</td>
+            <td>CUDA 使用</td>
+          </tr>
+          <tr>
+            <td><code>dense_attention_mask</code></td>
+            <td>可广播到 <code>[B, Nq, Ld, Lc+Ld]</code></td>
+            <td>非 CUDA 路径使用的 dense mask。</td>
+            <td>CPU/NPU fallback 使用</td>
+          </tr>
+          <tr>
+            <td><code>noise_embedding</code></td>
+            <td><code>[B, Ld, Hd]</code></td>
+            <td>由真实 anchor token 与 mask tokens 组成的训练输入 embedding。</td>
+            <td>是</td>
+          </tr>
+          <tr>
+            <td>返回值</td>
+            <td><code>[B, Ld, Hd]</code></td>
+            <td>final RMSNorm 后的 draft hidden states。</td>
+            <td>交给外层 target head 计算 logits</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <div class="callout orange">
+        <strong>注意：<code>Lc</code> 与 <code>Ld</code> 不同</strong>
+        <code>Lc</code> 是 target context 长度；训练时 <code>Ld = A × block_size</code>，其中
+        <code>A</code> 是采样 anchor 数。示例配置中最多为 <code>64 × 16 = 1024</code> 个 draft positions。
+      </div>
+    </section>
+
+    <section id="forward">
+      <h2>5. Forward 完整链路</h2>
+
+      <div class="flow" aria-label="Forward 流程">
+        <div class="flow-step">
+          <b>① Target context</b>
+          <small>5 层 target hidden states 拼接，经 fc + RMSNorm 得到 context feature。</small>
+        </div>
+        <div class="flow-step">
+          <b>② Draft input</b>
+          <small>训练路径使用 anchor token + mask tokens 组成的 noise embedding。</small>
+        </div>
+        <div class="flow-step">
+          <b>③ Decoder layers</b>
+          <small>draft 作为 Query；context + draft 共同作为 KV；执行 masked GQA。</small>
+        </div>
+        <div class="flow-step">
+          <b>④ Final norm</b>
+          <small>所有 decoder layer 后执行最终 RMSNorm。</small>
+        </div>
+        <div class="flow-step">
+          <b>⑤ 外部 head</b>
+          <small>裸模型之外用 frozen target lm_head 投影 logits，再计算 restricted CE。</small>
+        </div>
+      </div>
+
+      <h3>5.1 调用前：训练包装器准备 context、noise 与 mask</h3>
+      <p><code>DFlashTrainingModel.forward()</code> 首先调用裸模型的
+        <code>extract_context_feature()</code>，然后采样 anchor、创建 noise embedding、位置 IDs 和 attention mask。</p>
+
+      <div class="evidence">
+        <div class="evidence-head">
+          <strong>Evidence E：外层训练包装器准备输入并调用裸模型</strong>
+          <span><code>verl_speco/backends/dflash_trainer_backend.py:313-357</code></span>
+        </div>
+        <pre><code>context_feature = self.draft_model.extract_context_feature(hidden_states_list)
+anchor_positions, block_keep_mask = self._sample_anchor_positions(...)
+noise_embedding = self._create_noise_embed(...)
+context_position_ids, draft_position_ids = self._create_position_ids(...)
+...
+draft_hidden = self.draft_model(
+    draft_input_ids=None,
+    context_feature=context_feature,
+    draft_position_ids=draft_position_ids,
+    context_position_ids=context_position_ids,
+    block_mask=block_mask,
+    dense_attention_mask=dense_attention_mask,
+    noise_embedding=noise_embedding,
+)</code></pre>
+      </div>
+
+      <h3>5.2 裸模型入口：选择 draft hidden 初值</h3>
+      <p>训练路径已经提供 <code>noise_embedding</code>，因此不会执行 embedding lookup；其 dtype 被转换为与
+        <code>context_feature</code> 相同。</p>
+      <pre><code>if noise_embedding is not None:
+    draft_hidden = noise_embedding.to(context_feature.dtype)
+else:
+    draft_hidden = self.embed_tokens(draft_input_ids).to(context_feature.dtype)</code></pre>
+      <p class="source">证据：<code>verl_speco/models/dflash/modeling_dflash.py:350-363</code></p>
+
+      <h3>5.3 遍历 decoder layers</h3>
+      <p>每一层都接收同一份 target <code>context_feature</code>，同时递归更新 draft hidden。context feature 本身不会在 layer 间变化。</p>
+      <pre><code>for layer in self.layers:
+    draft_hidden = layer(
+        draft_hidden=draft_hidden,
+        context_hidden=context_feature,
+        ...
+    )</code></pre>
+      <p class="source">证据：<code>verl_speco/models/dflash/modeling_dflash.py:365-373</code></p>
+
+      <h3>5.4 最终输出</h3>
+      <p>裸模型只做最终 RMSNorm，然后返回 hidden states：</p>
+      <pre><code>return self.norm(draft_hidden)</code></pre>
+      <p class="source">证据：<code>verl_speco/models/dflash/modeling_dflash.py:374</code></p>
+
+      <h3>5.5 Logits 与 loss 在裸模型之外</h3>
+      <p>外层训练包装器从有效 draft positions 中选择 hidden states，再使用传入的 frozen target
+        <code>lm_head_weight</code> 计算 logits。当前示例为 <code>restricted_ce</code>，只选择 active targets 与输入 token
+        构成的词表子集。</p>
+
+      <div class="evidence">
+        <div class="evidence-head">
+          <strong>Evidence F：target head 投影和 CE 不属于 DFlashDraftModel</strong>
+          <span><code>verl_speco/backends/dflash_trainer_backend.py:400-435</code></span>
+        </div>
+        <pre><code>active_hidden = flat_hidden[active_mask]
+active_targets = flat_targets[active_mask]
+...
+restricted_vocab = self._build_restricted_vocab(
+    input_ids, active_targets, vocab_size
+)
+restricted_weight = lm_head_weight.index_select(0, restricted_vocab)
+active_logits = F.linear(active_hidden, restricted_weight)
+active_loss = F.cross_entropy(
+    active_logits, active_ce_targets, reduction="none"
+)</code></pre>
+      </div>
+    </section>
+
+    <section id="attention">
+      <h2>6. Dual-source Attention 细化</h2>
+
+      <p><code>DFlashAttention</code> 的关键不是普通 self-attention，而是：</p>
+      <div class="matrix">
+        <div>Query</div><div>只来自当前 draft hidden。</div>
+        <div>Key</div><div><code>K = concat(K_context, K_draft)</code>。</div>
+        <div>Value</div><div><code>V = concat(V_context, V_draft)</code>。</div>
+        <div>Mask</div><div>由 backend 构造，约束每个 draft block 能看到的 target prefix 与 block 内位置。</div>
+      </div>
+
+      <div class="evidence">
+        <div class="evidence-head">
+          <strong>Evidence G：Query 与双来源 KV</strong>
+          <span><code>verl_speco/models/dflash/modeling_dflash.py:158-176</code></span>
+        </div>
+        <pre><code>q = self.q_proj(draft_hidden).view(...)
+q = self.q_norm(q).transpose(1, 2)
+
+k_ctx = self.k_proj(context_hidden)
+v_ctx = self.v_proj(context_hidden)
+k_draft = self.k_proj(draft_hidden)
+v_draft = self.v_proj(draft_hidden)
+k = torch.cat([k_ctx, k_draft], dim=1)
+v = torch.cat([v_ctx, v_draft], dim=1)</code></pre>
+      </div>
+
+      <h3>6.1 RoPE 位置处理</h3>
+      <p>Query 只使用 <code>draft_position_ids</code>；Key 同时包含 context 和 draft，因此使用两者拼接后的
+        <code>full_position_ids</code>。这保证 target context 与 draft positions 位于同一位置坐标系。</p>
+      <pre><code>full_position_ids = torch.cat(
+    [context_position_ids, draft_position_ids], dim=1
+)
+...
+q = apply_rope(q, draft_position_ids)
+k = apply_rope(k, full_position_ids)</code></pre>
+      <p class="source">实际实现证据：<code>verl_speco/models/dflash/modeling_dflash.py:178-189</code></p>
+
+      <h3>6.2 CUDA 与 fallback 分支</h3>
+      <table>
+        <thead><tr><th>条件</th><th>实现</th><th>GQA 处理</th></tr></thead>
+        <tbody>
+          <tr>
+            <td><code>block_mask is not None</code></td>
+            <td><code>compile_friendly_flex_attention</code></td>
+            <td><code>enable_gqa=True</code></td>
+          </tr>
+          <tr>
+            <td>否则</td>
+            <td><code>F.scaled_dot_product_attention</code></td>
+            <td>先用 <code>repeat_kv()</code> 展开 KV heads</td>
+          </tr>
+        </tbody>
+      </table>
+      <p class="source">证据：<code>verl_speco/models/dflash/modeling_dflash.py:191-219</code></p>
+
+      <div class="callout green">
+        <strong>设计含义</strong>
+        Draft token 不需要重新运行完整 target model。它读取已经捕获并投影的 target context，同时通过受 mask
+        约束的 draft-to-draft attention 对一个 block 内的多个候选位置进行建模。
+      </div>
+    </section>
+
+    <section id="tensor-trace">
+      <h2>7. 训练路径张量形状追踪</h2>
+
+      <table>
+        <thead>
+          <tr><th>阶段</th><th>张量</th><th>形状</th><th>生产者 → 消费者</th></tr>
+        </thead>
+        <tbody>
+          <tr>
+            <td>Backend 输入</td>
+            <td><code>hidden_states</code></td>
+            <td><code>[B, Lc, C×Ht]</code></td>
+            <td>DrafterBaseTrainer → DFlashTrainerBackend</td>
+          </tr>
+          <tr>
+            <td>按 layer 拆分</td>
+            <td><code>hidden_states_list</code></td>
+            <td><code>C × [B, Lc, Ht]</code></td>
+            <td>DFlashTrainerBackend → DFlashTrainingModel</td>
+          </tr>
+          <tr>
+            <td>Context projection</td>
+            <td><code>context_feature</code></td>
+            <td><code>[B, Lc, Hd]</code></td>
+            <td>DFlashDraftModel.extract_context_feature → TrainingModel</td>
+          </tr>
+          <tr>
+            <td>Anchor sampling</td>
+            <td><code>anchor_positions</code></td>
+            <td><code>[B, A]</code></td>
+            <td>DFlashTrainingModel 内部</td>
+          </tr>
+          <tr>
+            <td>Draft/noise input</td>
+            <td><code>noise_embedding</code></td>
+            <td><code>[B, A×K, Hd]</code></td>
+            <td>DFlashTrainingModel → DFlashDraftModel</td>
+          </tr>
+          <tr>
+            <td>Attention Q</td>
+            <td><code>q</code></td>
+            <td><code>[B, Nq, A×K, Dh]</code></td>
+            <td>q_proj → attention kernel</td>
+          </tr>
+          <tr>
+            <td>Attention K/V</td>
+            <td><code>k, v</code></td>
+            <td><code>[B, Nkv, Lc+A×K, Dh]</code></td>
+            <td>context+draft projection → attention kernel</td>
+          </tr>
+          <tr>
+            <td>裸模型输出</td>
+            <td><code>draft_hidden</code></td>
+            <td><code>[B, A×K, Hd]</code></td>
+            <td>DFlashDraftModel → DFlashTrainingModel</td>
+          </tr>
+          <tr>
+            <td>Active hidden</td>
+            <td><code>active_hidden</code></td>
+            <td><code>[Tactive, Hd]</code></td>
+            <td>loss mask 选择 → frozen target head</td>
+          </tr>
+          <tr>
+            <td>Restricted logits</td>
+            <td><code>active_logits</code></td>
+            <td><code>[Tactive, Vrestricted]</code></td>
+            <td>F.linear → cross_entropy</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p><code>K</code> 是 block size，示例为 16；<code>A</code> 最多 64；<code>Lc</code> 在预处理后最多 512；
+        <code>Tactive</code> 由有效 anchor、block 内有效位置和 response loss mask 共同决定。</p>
+
+      <div class="callout">
+        <strong>设备与梯度边界</strong>
+        Target hidden states 在 old-logprob 路径已经 detach、复制到 CPU，再送到 drafter worker；训练 batch 随后搬到 drafter
+        GPU。因而该 forward/backward 图只连接 drafter 参数，不会反向传播回 Qwen3 actor。target <code>lm_head</code> 和
+        drafter embedding 同样被冻结。
+      </div>
+    </section>
+
+    <section id="evidence-index">
+      <h2>8. 代码证据索引</h2>
+
+      <table>
+        <thead><tr><th>结论</th><th>源码位置</th><th>证据内容</th></tr></thead>
+        <tbody>
+          <tr>
+            <td>DFlash config 中 context layers 与 target 总层数语义不同</td>
+            <td><code>configuration_dflash.py:21-28, 43-47</code></td>
+            <td>docstring 与配置字段分别定义 <code>num_target_layers</code>、<code>num_context_layers</code>。</td>
+          </tr>
+          <tr>
+            <td>未指定 target layer IDs 时均匀选层</td>
+            <td><code>modeling_dflash.py:100-110, 313-322</code></td>
+            <td><code>build_target_layer_ids()</code> 及构造函数调用。</td>
+          </tr>
+          <tr>
+            <td>Context 由 C 层拼接并投影</td>
+            <td><code>modeling_dflash.py:328-348</code></td>
+            <td><code>fc(C×Ht → Hd)</code> 与 <code>extract_context_feature()</code>。</td>
+          </tr>
+          <tr>
+            <td>裸 forward 支持 noise embedding 或 input IDs</td>
+            <td><code>modeling_dflash.py:350-364</code></td>
+            <td>二选一初始化 <code>draft_hidden</code>。</td>
+          </tr>
+          <tr>
+            <td>Decoder 是 Pre-Norm attention + MLP 残差</td>
+            <td><code>modeling_dflash.py:239-275</code></td>
+            <td>两次 norm、两次 residual。</td>
+          </tr>
+          <tr>
+            <td>Attention Query 只来自 draft，KV 来自 context+draft</td>
+            <td><code>modeling_dflash.py:149-176</code></td>
+            <td>q/k/v projection 与 KV concat。</td>
+          </tr>
+          <tr>
+            <td>RoPE 使用统一的 context+draft 坐标系</td>
+            <td><code>modeling_dflash.py:178-189</code></td>
+            <td>Query 用 draft positions，Key 用 full positions。</td>
+          </tr>
+          <tr>
+            <td>CUDA 使用 FlexAttention，fallback 使用 SDPA</td>
+            <td><code>modeling_dflash.py:191-219</code></td>
+            <td>依据 <code>block_mask</code> 分支。</td>
+          </tr>
+          <tr>
+            <td>裸模型输出 hidden states 而非 logits</td>
+            <td><code>modeling_dflash.py:365-374</code></td>
+            <td>遍历 layers 后仅返回 final norm 结果。</td>
+          </tr>
+          <tr>
+            <td>Logits 与 CE 在训练包装器中</td>
+            <td><code>dflash_trainer_backend.py:400-452</code></td>
+            <td>外层执行 <code>F.linear</code> 和 <code>F.cross_entropy</code>。</td>
+          </tr>
+          <tr>
+            <td>Embedding 从 target 加载后被冻结</td>
+            <td><code>dflash_trainer_backend.py:975-982</code><br><code>modeling_dflash.py:376-400</code></td>
+            <td><code>load_embedding()</code> 后调用 <code>freeze_embedding()</code>。</td>
+          </tr>
+        </tbody>
+      </table>
+
+      <p class="source">所有路径均相对于仓库目录 <code>verl-SpeCo/</code>。行号以 2026-08-11 本地工作区源码为准。</p>
+    </section>
+
+    <section id="why">
+      <h2>9. What / How / Why</h2>
+
+      <div class="cards">
+        <article class="card">
+          <strong>What</strong>
+          <p>将 target model 已计算出的多层上下文表示压缩为 context memory，并从带噪 draft blocks 产生可由 target head 解码的 hidden states。</p>
+        </article>
+        <article class="card">
+          <strong>How</strong>
+          <p>多层 hidden concat/project；draft token 做 Query；target context 与 draft token 联合作为 KV；mask 控制每个 block 的合法信息流。</p>
+        </article>
+        <article class="card">
+          <strong>Why</strong>
+          <p>避免重复运行完整 target Transformer，同时让 drafter 使用 target 的上下文表征，并通过共享/同步的 target head 学习 token prediction。</p>
+        </article>
+      </div>
+
+      <h3>必须保持的源码不变量</h3>
+      <ul>
+        <li><code>len(hidden_states_list) == num_context_layers</code>。</li>
+        <li>每层 target hidden 的最后一维必须等于 <code>target_hidden_size</code>。</li>
+        <li><code>target_layer_ids</code> 数量必须等于 <code>num_context_layers</code>。</li>
+        <li><code>block_mask</code> 与 <code>dense_attention_mask</code> 不能同时传入 attention。</li>
+        <li>裸模型输出维度必须与 target <code>lm_head</code> 输入 hidden size兼容。</li>
+        <li>训练路径中 target head 和 embedding 不应接收梯度。</li>
+      </ul>
+
+      <h3>自检问题</h3>
+      <ol>
+        <li>为什么 <code>DFlashDraftModel.forward()</code> 的签名中没有 <code>lm_head_weight</code> 和 labels？</li>
+        <li>为什么 Query 只来自 draft，而 KV 要拼接 target context 与 draft hidden？</li>
+        <li>如果将 <code>num_context_layers</code> 从 5 改为 4，哪些 config、checkpoint shape 和 hidden capture 位置必须同步变化？</li>
+        <li>训练时为什么传 <code>noise_embedding</code> 而不是直接传 <code>draft_input_ids</code>？</li>
+      </ol>
+    </section>
+
+    <footer>
+      本文仅整理已观察到的本地源码行为；不把 vLLM runtime 的独立 serving 实现等同于该 PyTorch training model。
+    </footer>
+  </main>
+</body>
+</html>
