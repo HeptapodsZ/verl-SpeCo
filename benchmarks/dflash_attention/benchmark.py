@@ -40,7 +40,14 @@ from verl_speco.models.dflash.kernels import (
 )
 
 
-BACKENDS = ("flex", "sdpa", "triton", "tilelang")
+BACKENDS = (
+    "flex",
+    "sdpa",
+    "triton",
+    "triton_two_anchor",
+    "triton_persistent",
+    "tilelang",
+)
 FORWARD_LIMITS = {
     "atol": 2e-2,
     "rtol": 2e-2,
@@ -207,7 +214,12 @@ def backend_callable(
 
         return call, dense_mask.numel() * dense_mask.element_size()
 
-    if backend not in ("triton", "tilelang"):
+    if backend not in (
+        "triton",
+        "triton_two_anchor",
+        "triton_persistent",
+        "tilelang",
+    ):
         raise ValueError(f"Unknown backend {backend!r}")
 
     def call(query, key, value):

@@ -338,6 +338,12 @@ class DFlashTrainingModel(nn.Module):
                 self.block_size,
             )
 
+        custom_attention_backend = selected_backend in (
+            "triton",
+            "triton_two_anchor",
+            "triton_persistent",
+            "tilelang",
+        )
         draft_hidden = self.draft_model(
             draft_input_ids=None,
             context_feature=context_feature,
@@ -347,15 +353,9 @@ class DFlashTrainingModel(nn.Module):
             dense_attention_mask=dense_attention_mask,
             noise_embedding=noise_embedding,
             attention_backend=selected_backend,
-            anchor_positions=(
-                anchor_positions if selected_backend in ("triton", "tilelang") else None
-            ),
-            block_keep_mask=(
-                block_keep_mask if selected_backend in ("triton", "tilelang") else None
-            ),
-            block_size=(
-                self.block_size if selected_backend in ("triton", "tilelang") else None
-            ),
+            anchor_positions=(anchor_positions if custom_attention_backend else None),
+            block_keep_mask=(block_keep_mask if custom_attention_backend else None),
+            block_size=(self.block_size if custom_attention_backend else None),
         )
         label_offsets = self._cached_arange(
             "label_offsets", self.block_size, device, view_shape=(1, 1, -1)

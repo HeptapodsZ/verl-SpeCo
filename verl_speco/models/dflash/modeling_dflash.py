@@ -199,8 +199,17 @@ class DFlashAttention(nn.Module):
                 f"Unknown DFlash attention backend {attention_backend!r}; "
                 f"expected one of {sorted(DFLASH_ATTENTION_BACKENDS)}"
             )
-        if attention_backend in ("triton", "tilelang"):
-            if anchor_positions is None or block_keep_mask is None or block_size is None:
+        if attention_backend in (
+            "triton",
+            "triton_two_anchor",
+            "triton_persistent",
+            "tilelang",
+        ):
+            if (
+                anchor_positions is None
+                or block_keep_mask is None
+                or block_size is None
+            ):
                 raise ValueError(
                     f"DFlash {attention_backend} attention requires anchors, keep mask, and block size"
                 )

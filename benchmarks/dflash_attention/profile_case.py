@@ -12,13 +12,28 @@ from benchmark import Case, backend_callable, make_inputs
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--backend", choices=("flex", "sdpa", "triton", "tilelang"), required=True)
+    parser.add_argument(
+        "--backend",
+        choices=(
+            "flex",
+            "sdpa",
+            "triton",
+            "triton_two_anchor",
+            "triton_persistent",
+            "tilelang",
+        ),
+        required=True,
+    )
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--context-len", type=int, required=True)
     parser.add_argument("--block-size", type=int, required=True)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
-    parser.add_argument("--phase", choices=("forward", "backward", "forward_backward"), default="forward_backward")
+    parser.add_argument(
+        "--phase",
+        choices=("forward", "backward", "forward_backward"),
+        default="forward_backward",
+    )
     args = parser.parse_args()
     case = Case(args.batch_size, args.context_len, args.block_size)
     inputs = make_inputs(case, seed=0)

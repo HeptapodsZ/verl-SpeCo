@@ -64,7 +64,9 @@ def _forward_kernel(
     query_index = anchor_id * BLOCK_SIZE + token_offset
     query_valid = (offs_m < ACTIVE_ROWS) & (query_head < (kv_head + 1) * GROUPS)
     q_ptrs = (
-        Q + ((batch_id * HQ + query_head[:, None]) * Q_LEN + query_index[:, None]) * HEAD_DIM
+        Q
+        + ((batch_id * HQ + query_head[:, None]) * Q_LEN + query_index[:, None])
+        * HEAD_DIM
         + offs_d[None, :]
     )
     q = tl.load(q_ptrs, mask=query_valid[:, None], other=0.0)
@@ -146,12 +148,315 @@ def _forward_kernel(
 
     output = acc / row_sum[:, None]
     o_ptrs = (
-        O + ((batch_id * HQ + query_head[:, None]) * Q_LEN + query_index[:, None]) * HEAD_DIM
+        O
+        + ((batch_id * HQ + query_head[:, None]) * Q_LEN + query_index[:, None])
+        * HEAD_DIM
         + offs_d[None, :]
     )
     lse_ptrs = LSE + (batch_id * HQ + query_head) * Q_LEN + query_index
     tl.store(o_ptrs, output, mask=query_valid[:, None])
     tl.store(lse_ptrs, row_max + tl.log(row_sum), mask=query_valid)
+
+
+@triton.jit
+def _forward_two_anchor_kernel(
+    Q,
+    K,
+    V,
+    ANCHORS,
+    KEEP,
+    O,
+    LSE,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    KV_LEN: tl.constexpr,
+    CTX_LEN: tl.constexpr,
+    NUM_ANCHORS: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUPS: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+    HEAD_CHUNKS: tl.constexpr,
+    ACTIVE_ROWS: tl.constexpr,
+    QUERY_ROWS: tl.constexpr,
+):
+    anchor_group = tl.program_id(0)
+    batch_kv_chunk = tl.program_id(1)
+    batch_id = batch_kv_chunk // (HK * HEAD_CHUNKS)
+    kv_chunk = batch_kv_chunk - batch_id * HK * HEAD_CHUNKS
+    kv_head = kv_chunk // HEAD_CHUNKS
+    head_chunk = kv_chunk - kv_head * HEAD_CHUNKS
+
+    offs_m = tl.arange(0, QUERY_ROWS)
+    rows_per_anchor = HEADS_PER_PROGRAM * BLOCK_SIZE
+    anchor_lane = offs_m // rows_per_anchor
+    head_token_offset = offs_m - anchor_lane * rows_per_anchor
+    head_lane = head_token_offset // BLOCK_SIZE
+    token_offset = head_token_offset - head_lane * BLOCK_SIZE
+    anchor_id = anchor_group * 2 + anchor_lane
+    anchor_valid = anchor_id < NUM_ANCHORS
+    query_head = kv_head * GROUPS + head_chunk * HEADS_PER_PROGRAM + head_lane
+    query_index = anchor_id * BLOCK_SIZE + token_offset
+    query_valid = (
+        (offs_m < ACTIVE_ROWS) & anchor_valid & (query_head < (kv_head + 1) * GROUPS)
+    )
+    offs_d = tl.arange(0, HEAD_DIM)
+    q_ptrs = (
+        Q
+        + ((batch_id * HQ + query_head[:, None]) * Q_LEN + query_index[:, None])
+        * HEAD_DIM
+        + offs_d[None, :]
+    )
+    q = tl.load(q_ptrs, mask=query_valid[:, None], other=0.0)
+    anchor = tl.load(
+        ANCHORS + batch_id * NUM_ANCHORS + anchor_id,
+        mask=anchor_valid,
+        other=0,
+    )
+    keep = (
+        tl.load(
+            KEEP + batch_id * NUM_ANCHORS + anchor_id,
+            mask=anchor_valid,
+            other=0,
+        )
+        != 0
+    )
+
+    row_max = tl.where(query_valid, -float("inf"), 0.0).to(tl.float32)
+    row_sum = tl.zeros((QUERY_ROWS,), tl.float32)
+    acc = tl.zeros((QUERY_ROWS, HEAD_DIM), tl.float32)
+
+    # Adjacent sampled anchors are sorted.  Scan to the larger prefix once and
+    # mask each query row against its own (possibly shorter) anchor position.
+    max_anchor = tl.max(tl.where(anchor_valid, anchor, 0), axis=0)
+    for start_n in tl.range(0, max_anchor, BLOCK_N, num_stages=2):
+        offs_n = start_n + tl.arange(0, BLOCK_N)
+        key_valid = offs_n < max_anchor
+        k_ptrs = (
+            K
+            + ((batch_id * HK + kv_head) * KV_LEN + offs_n[:, None]) * HEAD_DIM
+            + offs_d[None, :]
+        )
+        v_ptrs = (
+            V
+            + ((batch_id * HK + kv_head) * KV_LEN + offs_n[:, None]) * HEAD_DIM
+            + offs_d[None, :]
+        )
+        k = tl.load(k_ptrs, mask=key_valid[:, None], other=0.0)
+        v = tl.load(v_ptrs, mask=key_valid[:, None], other=0.0)
+        scores = tl.dot(q, tl.trans(k)) * SCALE
+        allowed = (
+            query_valid[:, None] & (offs_n[None, :] < anchor[:, None]) & keep[:, None]
+        )
+        scores = tl.where(allowed, scores, -float("inf"))
+        tile_max = tl.max(scores, axis=1)
+        has_context_tile = query_valid & keep & (start_n < anchor)
+        new_max = tl.where(has_context_tile, tl.maximum(row_max, tile_max), row_max)
+        alpha = tl.where(
+            has_context_tile,
+            tl.exp2((row_max - new_max) * _LOG2E),
+            1.0,
+        )
+        probs = tl.where(
+            allowed,
+            tl.exp2((scores - new_max[:, None]) * _LOG2E),
+            0.0,
+        )
+        acc = acc * alpha[:, None] + tl.dot(probs.to(Q.dtype.element_ty), v)
+        row_sum = row_sum * alpha + tl.sum(probs, axis=1)
+        row_max = new_max
+
+    # Concatenate the two local draft blocks into one K/V tile, then apply a
+    # block-diagonal mask so each query attends only to its own draft block.
+    offs_n_local = tl.arange(0, 2 * BLOCK_M)
+    local_anchor_lane = offs_n_local // BLOCK_SIZE
+    local_token_offset = offs_n_local - local_anchor_lane * BLOCK_SIZE
+    local_anchor_id = anchor_group * 2 + local_anchor_lane
+    local_valid = (offs_n_local < 2 * BLOCK_SIZE) & (local_anchor_id < NUM_ANCHORS)
+    local_index = CTX_LEN + local_anchor_id * BLOCK_SIZE + local_token_offset
+    k_ptrs = (
+        K
+        + ((batch_id * HK + kv_head) * KV_LEN + local_index[:, None]) * HEAD_DIM
+        + offs_d[None, :]
+    )
+    v_ptrs = (
+        V
+        + ((batch_id * HK + kv_head) * KV_LEN + local_index[:, None]) * HEAD_DIM
+        + offs_d[None, :]
+    )
+    k = tl.load(k_ptrs, mask=local_valid[:, None], other=0.0)
+    v = tl.load(v_ptrs, mask=local_valid[:, None], other=0.0)
+    scores = tl.dot(q, tl.trans(k)) * SCALE
+    same_anchor = anchor_id[:, None] == local_anchor_id[None, :]
+    valid_rows_cols = query_valid[:, None] & local_valid[None, :] & same_anchor
+    local_allowed = valid_rows_cols & tl.where(
+        keep[:, None],
+        True,
+        token_offset[:, None] == local_token_offset[None, :],
+    )
+    scores = tl.where(local_allowed, scores, -float("inf"))
+    tile_max = tl.max(scores, axis=1)
+    new_max = tl.maximum(row_max, tile_max)
+    alpha = tl.exp2((row_max - new_max) * _LOG2E)
+    probs = tl.where(
+        local_allowed,
+        tl.exp2((scores - new_max[:, None]) * _LOG2E),
+        0.0,
+    )
+    acc = acc * alpha[:, None] + tl.dot(probs.to(Q.dtype.element_ty), v)
+    row_sum = row_sum * alpha + tl.sum(probs, axis=1)
+    row_max = new_max
+
+    output = acc / row_sum[:, None]
+    o_ptrs = (
+        O
+        + ((batch_id * HQ + query_head[:, None]) * Q_LEN + query_index[:, None])
+        * HEAD_DIM
+        + offs_d[None, :]
+    )
+    lse_ptrs = LSE + (batch_id * HQ + query_head) * Q_LEN + query_index
+    tl.store(o_ptrs, output, mask=query_valid[:, None])
+    tl.store(lse_ptrs, row_max + tl.log(row_sum), mask=query_valid)
+
+
+@triton.jit
+def _forward_persistent_kernel(
+    Q,
+    K,
+    V,
+    ANCHORS,
+    KEEP,
+    O,
+    LSE,
+    HQ: tl.constexpr,
+    HK: tl.constexpr,
+    Q_LEN: tl.constexpr,
+    KV_LEN: tl.constexpr,
+    CTX_LEN: tl.constexpr,
+    NUM_ANCHORS: tl.constexpr,
+    SCALE: tl.constexpr,
+    BLOCK_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    GROUPS: tl.constexpr,
+    HEADS_PER_PROGRAM: tl.constexpr,
+    HEAD_CHUNKS: tl.constexpr,
+    ACTIVE_ROWS: tl.constexpr,
+    QUERY_ROWS: tl.constexpr,
+    TOTAL_WORK: tl.constexpr,
+    NUM_PROGRAMS: tl.constexpr,
+):
+    program_id = tl.program_id(0)
+    for work_id in tl.range(program_id, TOTAL_WORK, NUM_PROGRAMS):
+        anchor_id = work_id % NUM_ANCHORS
+        batch_kv_chunk = work_id // NUM_ANCHORS
+        batch_id = batch_kv_chunk // (HK * HEAD_CHUNKS)
+        kv_chunk = batch_kv_chunk - batch_id * HK * HEAD_CHUNKS
+        kv_head = kv_chunk // HEAD_CHUNKS
+        head_chunk = kv_chunk - kv_head * HEAD_CHUNKS
+
+        offs_m = tl.arange(0, QUERY_ROWS)
+        head_lane = offs_m // BLOCK_SIZE
+        token_offset = offs_m - head_lane * BLOCK_SIZE
+        query_head = kv_head * GROUPS + head_chunk * HEADS_PER_PROGRAM + head_lane
+        query_index = anchor_id * BLOCK_SIZE + token_offset
+        query_valid = (offs_m < ACTIVE_ROWS) & (query_head < (kv_head + 1) * GROUPS)
+        offs_d = tl.arange(0, HEAD_DIM)
+        q_ptrs = (
+            Q
+            + ((batch_id * HQ + query_head[:, None]) * Q_LEN + query_index[:, None])
+            * HEAD_DIM
+            + offs_d[None, :]
+        )
+        q = tl.load(q_ptrs, mask=query_valid[:, None], other=0.0)
+        anchor = tl.load(ANCHORS + batch_id * NUM_ANCHORS + anchor_id)
+        keep = tl.load(KEEP + batch_id * NUM_ANCHORS + anchor_id) != 0
+
+        row_max = tl.where(query_valid, -float("inf"), 0.0).to(tl.float32)
+        row_sum = tl.zeros((QUERY_ROWS,), tl.float32)
+        acc = tl.zeros((QUERY_ROWS, HEAD_DIM), tl.float32)
+
+        for start_n in tl.range(0, anchor, BLOCK_N, num_stages=2):
+            offs_n = start_n + tl.arange(0, BLOCK_N)
+            key_valid = offs_n < anchor
+            k_ptrs = (
+                K
+                + ((batch_id * HK + kv_head) * KV_LEN + offs_n[:, None]) * HEAD_DIM
+                + offs_d[None, :]
+            )
+            v_ptrs = (
+                V
+                + ((batch_id * HK + kv_head) * KV_LEN + offs_n[:, None]) * HEAD_DIM
+                + offs_d[None, :]
+            )
+            k = tl.load(k_ptrs, mask=key_valid[:, None], other=0.0)
+            v = tl.load(v_ptrs, mask=key_valid[:, None], other=0.0)
+            scores = tl.dot(q, tl.trans(k)) * SCALE
+            allowed = query_valid[:, None] & key_valid[None, :] & keep
+            scores = tl.where(allowed, scores, -float("inf"))
+            tile_max = tl.max(scores, axis=1)
+            has_context = query_valid & keep
+            new_max = tl.where(has_context, tl.maximum(row_max, tile_max), row_max)
+            alpha = tl.where(
+                has_context,
+                tl.exp2((row_max - new_max) * _LOG2E),
+                1.0,
+            )
+            probs = tl.where(
+                allowed,
+                tl.exp2((scores - new_max[:, None]) * _LOG2E),
+                0.0,
+            )
+            acc = acc * alpha[:, None] + tl.dot(probs.to(Q.dtype.element_ty), v)
+            row_sum = row_sum * alpha + tl.sum(probs, axis=1)
+            row_max = new_max
+
+        offs_n_local = tl.arange(0, BLOCK_M)
+        local_index = CTX_LEN + anchor_id * BLOCK_SIZE + offs_n_local
+        local_valid = offs_n_local < BLOCK_SIZE
+        k_ptrs = (
+            K
+            + ((batch_id * HK + kv_head) * KV_LEN + local_index[:, None]) * HEAD_DIM
+            + offs_d[None, :]
+        )
+        v_ptrs = (
+            V
+            + ((batch_id * HK + kv_head) * KV_LEN + local_index[:, None]) * HEAD_DIM
+            + offs_d[None, :]
+        )
+        k = tl.load(k_ptrs, mask=local_valid[:, None], other=0.0)
+        v = tl.load(v_ptrs, mask=local_valid[:, None], other=0.0)
+        scores = tl.dot(q, tl.trans(k)) * SCALE
+        valid_rows_cols = query_valid[:, None] & local_valid[None, :]
+        local_allowed = tl.where(
+            keep,
+            valid_rows_cols,
+            valid_rows_cols & (token_offset[:, None] == offs_n_local[None, :]),
+        )
+        scores = tl.where(local_allowed, scores, -float("inf"))
+        tile_max = tl.max(scores, axis=1)
+        new_max = tl.maximum(row_max, tile_max)
+        alpha = tl.exp2((row_max - new_max) * _LOG2E)
+        probs = tl.exp2((scores - new_max[:, None]) * _LOG2E)
+        acc = acc * alpha[:, None] + tl.dot(probs.to(Q.dtype.element_ty), v)
+        row_sum = row_sum * alpha + tl.sum(probs, axis=1)
+        row_max = new_max
+
+        output = acc / row_sum[:, None]
+        o_ptrs = (
+            O
+            + ((batch_id * HQ + query_head[:, None]) * Q_LEN + query_index[:, None])
+            * HEAD_DIM
+            + offs_d[None, :]
+        )
+        lse_ptrs = LSE + (batch_id * HQ + query_head) * Q_LEN + query_index
+        tl.store(o_ptrs, output, mask=query_valid[:, None])
+        tl.store(lse_ptrs, row_max + tl.log(row_sum), mask=query_valid)
 
 
 @triton.jit
@@ -174,9 +479,8 @@ def _delta_kernel(
     query_index = anchor_id * BLOCK_SIZE + offs_m
     valid = offs_m < BLOCK_SIZE
     ptrs = (
-        ((batch_id * HQ + query_head) * Q_LEN + query_index[:, None]) * HEAD_DIM
-        + offs_d[None, :]
-    )
+        (batch_id * HQ + query_head) * Q_LEN + query_index[:, None]
+    ) * HEAD_DIM + offs_d[None, :]
     output = tl.load(O + ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
     grad_output = tl.load(DO + ptrs, mask=valid[:, None], other=0.0).to(tl.float32)
     delta = tl.sum(output * grad_output, axis=1)
@@ -354,9 +658,8 @@ def _backward_dkv_context_kernel(
     offs_d = tl.arange(0, HEAD_DIM)
     key_valid = offs_n < CTX_LEN
     kv_ptrs = (
-        ((batch_id * HK + kv_head) * KV_LEN + offs_n[:, None]) * HEAD_DIM
-        + offs_d[None, :]
-    )
+        (batch_id * HK + kv_head) * KV_LEN + offs_n[:, None]
+    ) * HEAD_DIM + offs_d[None, :]
     k = tl.load(K + kv_ptrs, mask=key_valid[:, None], other=0.0)
     v = tl.load(V + kv_ptrs, mask=key_valid[:, None], other=0.0)
     dk = tl.zeros((BLOCK_N, HEAD_DIM), tl.float32)
@@ -396,7 +699,11 @@ def _backward_dkv_context_kernel(
                     other=0.0,
                 )
                 scores = tl.dot(q, tl.trans(k)) * SCALE
-                allowed = query_valid[:, None] & key_valid[None, :] & (offs_n[None, :] < anchor)
+                allowed = (
+                    query_valid[:, None]
+                    & key_valid[None, :]
+                    & (offs_n[None, :] < anchor)
+                )
                 probs = tl.where(
                     allowed,
                     tl.exp2((scores - lse[:, None]) * _LOG2E),
@@ -446,9 +753,8 @@ def _backward_dkv_draft_kernel(
     query_index = anchor_id * BLOCK_SIZE + offs_m
     local_index = CTX_LEN + anchor_id * BLOCK_SIZE + offs_n
     kv_ptrs = (
-        ((batch_id * HK + kv_head) * KV_LEN + local_index[:, None]) * HEAD_DIM
-        + offs_d[None, :]
-    )
+        (batch_id * HK + kv_head) * KV_LEN + local_index[:, None]
+    ) * HEAD_DIM + offs_d[None, :]
     k = tl.load(K + kv_ptrs, mask=key_valid[:, None], other=0.0)
     v = tl.load(V + kv_ptrs, mask=key_valid[:, None], other=0.0)
     keep = tl.load(KEEP + batch_id * NUM_ANCHORS + anchor_id) != 0
@@ -504,9 +810,7 @@ def _backward_dkv_draft_kernel(
 def _launch_config(
     block_size: int, ctx_len: int, device: torch.device
 ) -> tuple[int, int, int, int]:
-    config = get_triton_tuning(
-        block_size=block_size, ctx_len=ctx_len, device=device
-    )
+    config = get_triton_tuning(block_size=block_size, ctx_len=ctx_len, device=device)
     return config.block_m, config.block_n, config.num_warps, config.num_stages
 
 
@@ -519,8 +823,11 @@ def triton_dflash_attention_forward(
     *,
     ctx_len: int,
     block_size: int,
+    forward_variant: str = "baseline",
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the Triton forward kernel and return output plus natural-log LSE."""
+    if forward_variant not in ("baseline", "two_anchor", "persistent"):
+        raise ValueError(f"Unknown DFlash Triton forward variant {forward_variant!r}")
     bsz, num_query_heads, query_len, head_dim = query.shape
     num_kv_heads = key.shape[1]
     num_anchors = anchor_positions.shape[1]
@@ -533,8 +840,10 @@ def triton_dflash_attention_forward(
     active_rows = int(block_size) * heads_per_program
     query_rows = max(16, triton.next_power_of_2(active_rows))
     output = torch.empty_like(query)
-    lse = torch.empty((bsz, num_query_heads, query_len), device=query.device, dtype=torch.float32)
-    _forward_kernel[(num_anchors, bsz * num_kv_heads * head_chunks)](
+    lse = torch.empty(
+        (bsz, num_query_heads, query_len), device=query.device, dtype=torch.float32
+    )
+    common_args = (
         query,
         key,
         value,
@@ -542,6 +851,8 @@ def triton_dflash_attention_forward(
         block_keep_mask,
         output,
         lse,
+    )
+    common_meta = dict(
         HQ=num_query_heads,
         HK=num_kv_heads,
         Q_LEN=query_len,
@@ -561,6 +872,40 @@ def triton_dflash_attention_forward(
         num_warps=num_warps,
         num_stages=num_stages,
     )
+    batch_kv_chunks = bsz * num_kv_heads * head_chunks
+    if forward_variant == "baseline":
+        _forward_kernel[(num_anchors, batch_kv_chunks)](*common_args, **common_meta)
+    elif forward_variant == "two_anchor":
+        anchors_per_program = 2
+        two_anchor_active_rows = active_rows * anchors_per_program
+        two_anchor_query_rows = max(16, triton.next_power_of_2(two_anchor_active_rows))
+        two_anchor_meta = {
+            **common_meta,
+            "ACTIVE_ROWS": two_anchor_active_rows,
+            "QUERY_ROWS": two_anchor_query_rows,
+        }
+        two_anchor_meta.update(BLOCK_N=32, num_warps=4, num_stages=2)
+        _forward_two_anchor_kernel[
+            (triton.cdiv(num_anchors, anchors_per_program), batch_kv_chunks)
+        ](*common_args, **two_anchor_meta)
+    else:
+        total_work = num_anchors * batch_kv_chunks
+        sm_count = torch.cuda.get_device_properties(query.device).multi_processor_count
+        # Match the measured two-CTA/SM residency while reducing the default
+        # 1024-work-item grid to a persistent queue of 168 CTAs on RTX 5080.
+        num_programs = min(total_work, sm_count * 2)
+        persistent_meta = {
+            **common_meta,
+            "BLOCK_N": 64,
+            "num_warps": 4,
+            "num_stages": 2,
+        }
+        _forward_persistent_kernel[(num_programs,)](
+            *common_args,
+            **persistent_meta,
+            TOTAL_WORK=total_work,
+            NUM_PROGRAMS=num_programs,
+        )
     return output, lse
 
 
@@ -617,7 +962,9 @@ def _triton_backward(
         num_stages=num_stages,
     )
     if ctx_len > 0:
-        _backward_dkv_context_kernel[(triton.cdiv(ctx_len, block_n), bsz * num_kv_heads)](
+        _backward_dkv_context_kernel[
+            (triton.cdiv(ctx_len, block_n), bsz * num_kv_heads)
+        ](
             query,
             key,
             value,
@@ -680,6 +1027,7 @@ class _TritonDFlashAttention(torch.autograd.Function):
         block_keep_mask: torch.Tensor,
         ctx_len: int,
         block_size: int,
+        forward_variant: str,
     ) -> torch.Tensor:
         output, lse = triton_dflash_attention_forward(
             query,
@@ -689,6 +1037,7 @@ class _TritonDFlashAttention(torch.autograd.Function):
             block_keep_mask,
             ctx_len=int(ctx_len),
             block_size=int(block_size),
+            forward_variant=str(forward_variant),
         )
         ctx.save_for_backward(
             query,
@@ -720,7 +1069,7 @@ class _TritonDFlashAttention(torch.autograd.Function):
             ctx_len=ctx.ctx_len,
             block_size=ctx.block_size,
         )
-        return grad_query, grad_key, grad_value, None, None, None, None
+        return grad_query, grad_key, grad_value, None, None, None, None, None
 
 
 def triton_dflash_attention(
@@ -732,6 +1081,7 @@ def triton_dflash_attention(
     *,
     ctx_len: int,
     block_size: int,
+    forward_variant: str = "baseline",
 ) -> torch.Tensor:
     return _TritonDFlashAttention.apply(
         query,
@@ -741,4 +1091,5 @@ def triton_dflash_attention(
         block_keep_mask,
         int(ctx_len),
         int(block_size),
+        str(forward_variant),
     )

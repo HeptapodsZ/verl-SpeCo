@@ -8,8 +8,20 @@ from __future__ import annotations
 
 import torch
 
-DFLASH_ATTENTION_BACKENDS = frozenset({"auto", "flex", "sdpa", "triton", "tilelang"})
-_CUSTOM_BACKENDS = frozenset({"triton", "tilelang"})
+DFLASH_ATTENTION_BACKENDS = frozenset(
+    {
+        "auto",
+        "flex",
+        "sdpa",
+        "triton",
+        "triton_two_anchor",
+        "triton_persistent",
+        "tilelang",
+    }
+)
+_CUSTOM_BACKENDS = frozenset(
+    {"triton", "triton_two_anchor", "triton_persistent", "tilelang"}
+)
 _SUPPORTED_BLOCK_SIZES = frozenset({16})
 _SUPPORTED_HEAD_DIMS = frozenset({64, 128})
 
@@ -78,7 +90,7 @@ def dflash_sparse_attention(
     """Run a custom DFlash attention backend with a shared autograd contract."""
     backend = str(backend).lower()
     if backend not in _CUSTOM_BACKENDS:
-        raise ValueError(f"Custom DFlash dispatch expected triton/tilelang, got {backend!r}")
+        raise ValueError(f"Unknown custom DFlash attention backend {backend!r}")
     _validate_custom_inputs(
         query, key, value, anchor_positions, block_keep_mask, ctx_len, block_size
     )
@@ -87,9 +99,14 @@ def dflash_sparse_attention(
     value = value.contiguous()
     anchors_i32 = anchor_positions.to(dtype=torch.int32).contiguous()
     keep_i32 = block_keep_mask.to(dtype=torch.int32).contiguous()
-    if backend == "triton":
+    if backend.startswith("triton"):
         from .triton_attention import triton_dflash_attention
 
+        forward_variant = {
+            "triton": "baseline",
+            "triton_two_anchor": "two_anchor",
+            "triton_persistent": "persistent",
+        }[backend]
         return triton_dflash_attention(
             query,
             key,
@@ -98,6 +115,7 @@ def dflash_sparse_attention(
             keep_i32,
             ctx_len=int(ctx_len),
             block_size=int(block_size),
+            forward_variant=forward_variant,
         )
 
     try:

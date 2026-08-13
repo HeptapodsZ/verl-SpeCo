@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-"""Focused SDPA-versus-Triton benchmark for DFlash attention.
+"""Focused SDPA-versus-three-Triton-variants benchmark for DFlash attention.
 
 The public process launches one fresh worker process per backend. This keeps
 CUDA allocator state and backend compilation state from contaminating the
@@ -43,7 +43,12 @@ from benchmarks.dflash_attention.benchmark import (  # noqa: E402
 )
 
 
-BACKENDS = ("sdpa", "triton")
+TRITON_BACKENDS = (
+    "triton",
+    "triton_two_anchor",
+    "triton_persistent",
+)
+BACKENDS = ("sdpa", *TRITON_BACKENDS)
 PHASES = ("forward", "forward_backward")
 
 
@@ -304,7 +309,7 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
 def combine_worker_payloads(
     workers: dict[str, dict[str, object]], *, command: str
 ) -> dict[str, object]:
-    """Join isolated worker results and calculate direct comparison metrics."""
+    """Join isolated worker results and compare every Triton variant with SDPA."""
     indexed = {
         backend: {
             str(record["case_id"]): record
@@ -325,45 +330,62 @@ def combine_worker_payloads(
             "case": backend_records["sdpa"]["case"],
             "backends": backend_records,
         }
-        if all(record.get("status") == "ok" for record in backend_records.values()):
+        sdpa_record = backend_records["sdpa"]
+        if sdpa_record.get("status") == "ok":
             phase_comparisons = {}
             for phase_name in PHASES:
-                sdpa = backend_records["sdpa"]["phases"][phase_name]
-                triton = backend_records["triton"]["phases"][phase_name]
+                sdpa = sdpa_record["phases"][phase_name]
                 sdpa_memory = sdpa["memory"]
-                triton_memory = triton["memory"]
-                phase_comparisons[phase_name] = {
-                    "triton_latency_speedup": _safe_ratio(
-                        float(sdpa["p50_ms"]), float(triton["p50_ms"])
-                    ),
-                    "triton_query_throughput_speedup": _safe_ratio(
-                        float(triton["query_tokens_per_second"]),
-                        float(sdpa["query_tokens_per_second"]),
-                    ),
-                    "triton_effective_qk_throughput_speedup": _safe_ratio(
-                        float(triton["effective_qk_pairs_per_second"]),
-                        float(sdpa["effective_qk_pairs_per_second"]),
-                    ),
-                    "triton_peak_allocated_saving_mib": (
-                        float(sdpa_memory["peak_allocated_mib"])
-                        - float(triton_memory["peak_allocated_mib"])
-                    ),
-                    "triton_peak_allocated_reduction_fraction": 1.0
-                    - _safe_ratio(
-                        float(triton_memory["peak_allocated_mib"]),
-                        float(sdpa_memory["peak_allocated_mib"]),
-                    ),
-                    "triton_peak_allocated_delta_reduction_fraction": 1.0
-                    - _safe_ratio(
-                        float(triton_memory["peak_allocated_delta_mib"]),
-                        float(sdpa_memory["peak_allocated_delta_mib"]),
-                    ),
-                }
+                phase_comparison = {}
+                for triton_backend in TRITON_BACKENDS:
+                    triton_record = backend_records.get(triton_backend)
+                    if triton_record is None or triton_record.get("status") != "ok":
+                        continue
+                    triton = triton_record["phases"][phase_name]
+                    triton_memory = triton["memory"]
+                    phase_comparison.update(
+                        {
+                            f"{triton_backend}_latency_speedup": _safe_ratio(
+                                float(sdpa["p50_ms"]), float(triton["p50_ms"])
+                            ),
+                            f"{triton_backend}_query_throughput_speedup": (
+                                _safe_ratio(
+                                    float(triton["query_tokens_per_second"]),
+                                    float(sdpa["query_tokens_per_second"]),
+                                )
+                            ),
+                            f"{triton_backend}_effective_qk_throughput_speedup": (
+                                _safe_ratio(
+                                    float(triton["effective_qk_pairs_per_second"]),
+                                    float(sdpa["effective_qk_pairs_per_second"]),
+                                )
+                            ),
+                            f"{triton_backend}_peak_allocated_saving_mib": (
+                                float(sdpa_memory["peak_allocated_mib"])
+                                - float(triton_memory["peak_allocated_mib"])
+                            ),
+                            f"{triton_backend}_peak_allocated_reduction_fraction": (
+                                1.0
+                                - _safe_ratio(
+                                    float(triton_memory["peak_allocated_mib"]),
+                                    float(sdpa_memory["peak_allocated_mib"]),
+                                )
+                            ),
+                            f"{triton_backend}_peak_allocated_delta_reduction_fraction": (
+                                1.0
+                                - _safe_ratio(
+                                    float(triton_memory["peak_allocated_delta_mib"]),
+                                    float(sdpa_memory["peak_allocated_delta_mib"]),
+                                )
+                            ),
+                        }
+                    )
+                phase_comparisons[phase_name] = phase_comparison
             combined["comparison"] = phase_comparisons
         combined_cases.append(combined)
 
     return {
-        "schema_version": 1,
+        "schema_version": 2,
         "environment": workers["sdpa"]["environment"],
         "command": command,
         "methodology": {
@@ -474,7 +496,10 @@ def _worker_command(
 
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Compare DFlash SDPA and Triton forward/F+B performance."
+        description=(
+            "Compare DFlash SDPA with baseline, two-anchor, and persistent "
+            "Triton forward/F+B performance."
+        )
     )
     parser.add_argument("--batch-sizes", default="1")
     parser.add_argument(
