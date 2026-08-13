@@ -10,7 +10,7 @@ import math
 
 import torch
 
-from .tuning import get_triton_tuning
+from .tuning import get_triton_backward_tuning, get_triton_tuning
 
 try:
     import triton
@@ -47,6 +47,7 @@ def _forward_kernel(
     HEAD_CHUNKS: tl.constexpr,
     ACTIVE_ROWS: tl.constexpr,
     QUERY_ROWS: tl.constexpr,
+    PIPELINE_STAGES: tl.constexpr,
 ):
     anchor_id = tl.program_id(0)
     batch_kv_chunk = tl.program_id(1)
@@ -78,7 +79,7 @@ def _forward_kernel(
     acc = tl.zeros((QUERY_ROWS, HEAD_DIM), tl.float32)
 
     # The loop bound is a runtime anchor, so 65K contexts do not get unrolled.
-    for start_n in tl.range(0, anchor, BLOCK_N, num_stages=2):
+    for start_n in tl.range(0, anchor, BLOCK_N, num_stages=PIPELINE_STAGES):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         key_valid = offs_n < anchor
         k_ptrs = (
@@ -183,6 +184,7 @@ def _forward_two_anchor_kernel(
     HEAD_CHUNKS: tl.constexpr,
     ACTIVE_ROWS: tl.constexpr,
     QUERY_ROWS: tl.constexpr,
+    PIPELINE_STAGES: tl.constexpr,
 ):
     anchor_group = tl.program_id(0)
     batch_kv_chunk = tl.program_id(1)
@@ -233,7 +235,7 @@ def _forward_two_anchor_kernel(
     # Adjacent sampled anchors are sorted.  Scan to the larger prefix once and
     # mask each query row against its own (possibly shorter) anchor position.
     max_anchor = tl.max(tl.where(anchor_valid, anchor, 0), axis=0)
-    for start_n in tl.range(0, max_anchor, BLOCK_N, num_stages=2):
+    for start_n in tl.range(0, max_anchor, BLOCK_N, num_stages=PIPELINE_STAGES):
         offs_n = start_n + tl.arange(0, BLOCK_N)
         key_valid = offs_n < max_anchor
         k_ptrs = (
@@ -350,6 +352,7 @@ def _forward_persistent_kernel(
     QUERY_ROWS: tl.constexpr,
     TOTAL_WORK: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
+    PIPELINE_STAGES: tl.constexpr,
 ):
     program_id = tl.program_id(0)
     for work_id in tl.range(program_id, TOTAL_WORK, NUM_PROGRAMS):
@@ -381,7 +384,7 @@ def _forward_persistent_kernel(
         row_sum = tl.zeros((QUERY_ROWS,), tl.float32)
         acc = tl.zeros((QUERY_ROWS, HEAD_DIM), tl.float32)
 
-        for start_n in tl.range(0, anchor, BLOCK_N, num_stages=2):
+        for start_n in tl.range(0, anchor, BLOCK_N, num_stages=PIPELINE_STAGES):
             offs_n = start_n + tl.arange(0, BLOCK_N)
             key_valid = offs_n < anchor
             k_ptrs = (
@@ -807,10 +810,27 @@ def _backward_dkv_draft_kernel(
     tl.store(DV + kv_ptrs, dv, mask=key_valid[:, None])
 
 
-def _launch_config(
+def _forward_launch_config(
+    block_size: int,
+    ctx_len: int,
+    device: torch.device,
+    forward_variant: str,
+) -> tuple[int, int, int, int]:
+    config = get_triton_tuning(
+        forward_variant=forward_variant,
+        block_size=block_size,
+        ctx_len=ctx_len,
+        device=device,
+    )
+    return config.block_m, config.block_n, config.num_warps, config.num_stages
+
+
+def _backward_launch_config(
     block_size: int, ctx_len: int, device: torch.device
 ) -> tuple[int, int, int, int]:
-    config = get_triton_tuning(block_size=block_size, ctx_len=ctx_len, device=device)
+    config = get_triton_backward_tuning(
+        block_size=block_size, ctx_len=ctx_len, device=device
+    )
     return config.block_m, config.block_n, config.num_warps, config.num_stages
 
 
@@ -831,8 +851,8 @@ def triton_dflash_attention_forward(
     bsz, num_query_heads, query_len, head_dim = query.shape
     num_kv_heads = key.shape[1]
     num_anchors = anchor_positions.shape[1]
-    block_m, block_n, num_warps, num_stages = _launch_config(
-        block_size, ctx_len, query.device
+    block_m, block_n, num_warps, num_stages = _forward_launch_config(
+        block_size, ctx_len, query.device, forward_variant
     )
     groups = num_query_heads // num_kv_heads
     heads_per_program = min(2, groups)
@@ -869,6 +889,7 @@ def triton_dflash_attention_forward(
         HEAD_CHUNKS=head_chunks,
         ACTIVE_ROWS=active_rows,
         QUERY_ROWS=query_rows,
+        PIPELINE_STAGES=num_stages,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -884,7 +905,6 @@ def triton_dflash_attention_forward(
             "ACTIVE_ROWS": two_anchor_active_rows,
             "QUERY_ROWS": two_anchor_query_rows,
         }
-        two_anchor_meta.update(BLOCK_N=32, num_warps=4, num_stages=2)
         _forward_two_anchor_kernel[
             (triton.cdiv(num_anchors, anchors_per_program), batch_kv_chunks)
         ](*common_args, **two_anchor_meta)
@@ -894,12 +914,7 @@ def triton_dflash_attention_forward(
         # Match the measured two-CTA/SM residency while reducing the default
         # 1024-work-item grid to a persistent queue of 168 CTAs on RTX 5080.
         num_programs = min(total_work, sm_count * 2)
-        persistent_meta = {
-            **common_meta,
-            "BLOCK_N": 64,
-            "num_warps": 4,
-            "num_stages": 2,
-        }
+        persistent_meta = dict(common_meta)
         _forward_persistent_kernel[(num_programs,)](
             *common_args,
             **persistent_meta,
@@ -927,7 +942,7 @@ def _triton_backward(
     num_kv_heads = key.shape[1]
     num_anchors = anchor_positions.shape[1]
     groups = num_query_heads // num_kv_heads
-    block_m, block_n, num_warps, num_stages = _launch_config(
+    block_m, block_n, num_warps, num_stages = _backward_launch_config(
         block_size, ctx_len, query.device
     )
     delta = torch.empty_like(lse)
