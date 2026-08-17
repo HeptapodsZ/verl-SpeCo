@@ -12,8 +12,12 @@ from typing import Literal
 import torch
 
 
-ForwardVariant = Literal["baseline", "two_anchor", "persistent"]
-_FORWARD_VARIANTS = frozenset({"baseline", "two_anchor", "persistent"})
+ForwardVariant = Literal[
+    "baseline", "two_anchor", "persistent", "one_grid", "one_fixed_grid"
+]
+_FORWARD_VARIANTS = frozenset(
+    {"baseline", "two_anchor", "persistent", "one_grid", "one_fixed_grid"}
+)
 
 
 @dataclass(frozen=True)
@@ -32,6 +36,8 @@ _DEFAULT_FORWARD_TUNING: dict[str, DFlashKernelTuning] = {
     "baseline": DFlashKernelTuning(16, 64, 4, 2, "pull"),
     "two_anchor": DFlashKernelTuning(16, 32, 4, 2, "pull"),
     "persistent": DFlashKernelTuning(16, 64, 4, 2, "pull"),
+    "one_grid": DFlashKernelTuning(16, 64, 4, 2, "pull"),
+    "one_fixed_grid": DFlashKernelTuning(16, 64, 4, 2, "pull"),
 }
 _DEFAULT_BACKWARD_TUNING = DFlashKernelTuning(16, 64, 4, 2, "pull")
 
@@ -67,14 +73,31 @@ _FORWARD_DEVICE_PROFILES: dict[
             32768: DFlashKernelTuning(16, 64, 4, 2, "pull"),
             65536: DFlashKernelTuning(16, 64, 4, 2, "pull"),
         },
+        "one_grid": {
+            512: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            2048: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            8192: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            16384: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            32768: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            65536: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+        },
+        "one_fixed_grid": {
+            512: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            2048: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            8192: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            16384: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            32768: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+            65536: DFlashKernelTuning(16, 64, 4, 2, "pull"),
+        },
     },
     # Extension point, not an unverified H100 performance claim.
     "sm90": {},
 }
 
 
-# All three forward variants share the same backward kernels, so backward
-# tuning is intentionally independent of forward_variant.
+# All forward variants share the same backward math and tuning. The one-grid
+# specialization changes only the launch topology, so backward tuning remains
+# intentionally independent of forward_variant.
 _BACKWARD_DEVICE_PROFILES: dict[str, dict[int, DFlashKernelTuning]] = {
     "sm120": {
         512: DFlashKernelTuning(16, 64, 4, 2, "pull"),

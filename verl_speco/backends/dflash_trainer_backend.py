@@ -121,6 +121,7 @@ class DFlashTrainingModel(nn.Module):
         loss_mode: str = "full_vocab",
         sampled_ce_negatives: int = 0,
         attention_backend: str = "auto",
+        one_fixed_grid_size: int = 40,
     ):
         super().__init__()
         self.draft_model = draft_model
@@ -133,6 +134,12 @@ class DFlashTrainingModel(nn.Module):
         self.loss_mode = str(loss_mode or "full_vocab")
         self.sampled_ce_negatives = max(int(sampled_ce_negatives), 0)
         self.attention_backend = str(attention_backend or "auto").lower()
+        self.one_fixed_grid_size = int(one_fixed_grid_size)
+        if self.one_fixed_grid_size <= 0:
+            raise ValueError(
+                "DFlash one_fixed_grid size must be positive, "
+                f"got {self.one_fixed_grid_size}"
+            )
         if self.attention_backend not in DFLASH_ATTENTION_BACKENDS:
             raise ValueError(
                 f"Unknown DFlash attention backend {self.attention_backend!r}; "
@@ -342,6 +349,8 @@ class DFlashTrainingModel(nn.Module):
             "triton",
             "triton_two_anchor",
             "triton_persistent",
+            "triton_one_grid",
+            "triton_one_fixed_grid",
             "tilelang",
         )
         draft_hidden = self.draft_model(
@@ -356,6 +365,11 @@ class DFlashTrainingModel(nn.Module):
             anchor_positions=(anchor_positions if custom_attention_backend else None),
             block_keep_mask=(block_keep_mask if custom_attention_backend else None),
             block_size=(self.block_size if custom_attention_backend else None),
+            fixed_grid_size=(
+                self.one_fixed_grid_size
+                if selected_backend == "triton_one_fixed_grid"
+                else None
+            ),
         )
         label_offsets = self._cached_arange(
             "label_offsets", self.block_size, device, view_shape=(1, 1, -1)
@@ -1004,6 +1018,9 @@ class DFlashTrainerBackend:
             ),
             attention_backend=str(
                 training_cfg.get("dflash_attention_backend", "auto")
+            ),
+            one_fixed_grid_size=int(
+                training_cfg.get("dflash_one_fixed_grid_size", 40)
             ),
         ), drafter_config
 

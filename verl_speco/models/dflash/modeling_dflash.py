@@ -159,6 +159,7 @@ class DFlashAttention(nn.Module):
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
         block_size: Optional[int] = None,
+        fixed_grid_size: Optional[int] = None,
     ) -> torch.Tensor:
         bsz, draft_len, _ = draft_hidden.shape
         ctx_len = context_hidden.shape[1]
@@ -203,6 +204,8 @@ class DFlashAttention(nn.Module):
             "triton",
             "triton_two_anchor",
             "triton_persistent",
+            "triton_one_grid",
+            "triton_one_fixed_grid",
             "tilelang",
         ):
             if (
@@ -226,6 +229,9 @@ class DFlashAttention(nn.Module):
                 ctx_len=ctx_len,
                 block_size=int(block_size),
                 backend=attention_backend,
+                fixed_grid_size=(
+                    40 if fixed_grid_size is None else int(fixed_grid_size)
+                ),
             )
         elif attention_backend == "flex" or (
             attention_backend == "auto" and block_mask is not None
@@ -305,6 +311,7 @@ class DFlashDecoderLayer(nn.Module):
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
         block_size: Optional[int] = None,
+        fixed_grid_size: Optional[int] = None,
     ) -> torch.Tensor:
         residual = draft_hidden
         draft_hidden = self.input_layernorm(draft_hidden)
@@ -319,6 +326,7 @@ class DFlashDecoderLayer(nn.Module):
             anchor_positions=anchor_positions,
             block_keep_mask=block_keep_mask,
             block_size=block_size,
+            fixed_grid_size=fixed_grid_size,
         )
         draft_hidden = residual + draft_hidden
 
@@ -413,6 +421,7 @@ class DFlashDraftModel(PreTrainedModel):
         anchor_positions: Optional[torch.Tensor] = None,
         block_keep_mask: Optional[torch.Tensor] = None,
         block_size: Optional[int] = None,
+        fixed_grid_size: Optional[int] = None,
     ) -> torch.Tensor:
         if noise_embedding is not None:
             draft_hidden = noise_embedding.to(context_feature.dtype)
@@ -431,6 +440,7 @@ class DFlashDraftModel(PreTrainedModel):
                 anchor_positions=anchor_positions,
                 block_keep_mask=block_keep_mask,
                 block_size=block_size,
+                fixed_grid_size=fixed_grid_size,
             )
         return self.norm(draft_hidden)
 

@@ -2,7 +2,7 @@
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
-"""Focused SDPA-versus-three-Triton-variants benchmark for DFlash attention.
+"""Focused SDPA, FlexAttention, and Triton benchmark for DFlash attention.
 
 The public process launches one fresh worker process per backend. This keeps
 CUDA allocator state and backend compilation state from contaminating the
@@ -47,8 +47,11 @@ TRITON_BACKENDS = (
     "triton",
     "triton_two_anchor",
     "triton_persistent",
+    "triton_one_grid",
+    "triton_one_fixed_grid",
 )
-BACKENDS = ("sdpa", *TRITON_BACKENDS)
+COMPARISON_BACKENDS = ("flex", *TRITON_BACKENDS)
+BACKENDS = ("sdpa", *COMPARISON_BACKENDS)
 PHASES = ("forward", "forward_backward")
 
 
@@ -207,7 +210,9 @@ def _benchmark_case(
     backend: str, case: Case, args: argparse.Namespace
 ) -> dict[str, object]:
     inputs = make_inputs(case, args.seed)
-    call, structural_bytes = backend_callable(backend, case, inputs)
+    call, structural_bytes = backend_callable(
+        backend, case, inputs, fixed_grid_size=args.fixed_grid_size
+    )
     effective_pairs = visible_pairs(case, inputs)
     dense_pairs = (
         case.batch_size
@@ -268,7 +273,7 @@ def _benchmark_case(
 
 def run_worker(backend: str, args: argparse.Namespace) -> dict[str, object]:
     if not torch.cuda.is_available():
-        raise RuntimeError("The SDPA/Triton comparison requires CUDA")
+        raise RuntimeError("The DFlash attention comparison requires CUDA")
     records = []
     for case in _iter_cases(args):
         print(f"[{backend}] {case.case_id}", flush=True)
@@ -307,9 +312,16 @@ def _safe_ratio(numerator: float, denominator: float) -> float:
 
 
 def combine_worker_payloads(
-    workers: dict[str, dict[str, object]], *, command: str
+    workers: dict[str, dict[str, object]],
+    *,
+    command: str,
+    backends: tuple[str, ...] | None = None,
 ) -> dict[str, object]:
-    """Join isolated worker results and compare every Triton variant with SDPA."""
+    """Join isolated worker results and compare every non-SDPA backend with SDPA."""
+    selected_backends = BACKENDS if backends is None else backends
+    comparison_backends = tuple(
+        backend for backend in selected_backends if backend != "sdpa"
+    )
     indexed = {
         backend: {
             str(record["case_id"]): record
@@ -322,7 +334,7 @@ def combine_worker_payloads(
     for case_id in case_ids:
         backend_records = {
             backend: indexed[backend][case_id]
-            for backend in BACKENDS
+            for backend in selected_backends
             if case_id in indexed[backend]
         }
         combined: dict[str, object] = {
@@ -337,44 +349,44 @@ def combine_worker_payloads(
                 sdpa = sdpa_record["phases"][phase_name]
                 sdpa_memory = sdpa["memory"]
                 phase_comparison = {}
-                for triton_backend in TRITON_BACKENDS:
-                    triton_record = backend_records.get(triton_backend)
-                    if triton_record is None or triton_record.get("status") != "ok":
+                for comparison_backend in comparison_backends:
+                    backend_record = backend_records.get(comparison_backend)
+                    if backend_record is None or backend_record.get("status") != "ok":
                         continue
-                    triton = triton_record["phases"][phase_name]
-                    triton_memory = triton["memory"]
+                    measured = backend_record["phases"][phase_name]
+                    measured_memory = measured["memory"]
                     phase_comparison.update(
                         {
-                            f"{triton_backend}_latency_speedup": _safe_ratio(
-                                float(sdpa["p50_ms"]), float(triton["p50_ms"])
+                            f"{comparison_backend}_latency_speedup": _safe_ratio(
+                                float(sdpa["p50_ms"]), float(measured["p50_ms"])
                             ),
-                            f"{triton_backend}_query_throughput_speedup": (
+                            f"{comparison_backend}_query_throughput_speedup": (
                                 _safe_ratio(
-                                    float(triton["query_tokens_per_second"]),
+                                    float(measured["query_tokens_per_second"]),
                                     float(sdpa["query_tokens_per_second"]),
                                 )
                             ),
-                            f"{triton_backend}_effective_qk_throughput_speedup": (
+                            f"{comparison_backend}_effective_qk_throughput_speedup": (
                                 _safe_ratio(
-                                    float(triton["effective_qk_pairs_per_second"]),
+                                    float(measured["effective_qk_pairs_per_second"]),
                                     float(sdpa["effective_qk_pairs_per_second"]),
                                 )
                             ),
-                            f"{triton_backend}_peak_allocated_saving_mib": (
+                            f"{comparison_backend}_peak_allocated_saving_mib": (
                                 float(sdpa_memory["peak_allocated_mib"])
-                                - float(triton_memory["peak_allocated_mib"])
+                                - float(measured_memory["peak_allocated_mib"])
                             ),
-                            f"{triton_backend}_peak_allocated_reduction_fraction": (
+                            f"{comparison_backend}_peak_allocated_reduction_fraction": (
                                 1.0
                                 - _safe_ratio(
-                                    float(triton_memory["peak_allocated_mib"]),
+                                    float(measured_memory["peak_allocated_mib"]),
                                     float(sdpa_memory["peak_allocated_mib"]),
                                 )
                             ),
-                            f"{triton_backend}_peak_allocated_delta_reduction_fraction": (
+                            f"{comparison_backend}_peak_allocated_delta_reduction_fraction": (
                                 1.0
                                 - _safe_ratio(
-                                    float(triton_memory["peak_allocated_delta_mib"]),
+                                    float(measured_memory["peak_allocated_delta_mib"]),
                                     float(sdpa_memory["peak_allocated_delta_mib"]),
                                 )
                             ),
@@ -386,6 +398,7 @@ def combine_worker_payloads(
 
     return {
         "schema_version": 2,
+        "backends": list(selected_backends),
         "environment": workers["sdpa"]["environment"],
         "command": command,
         "methodology": {
@@ -404,6 +417,7 @@ def combine_worker_payloads(
 def flatten_comparisons(payload: dict[str, object]) -> list[dict[str, object]]:
     """Return one side-by-side CSV row per case and phase."""
     rows: list[dict[str, object]] = []
+    selected_backends = tuple(payload.get("backends", BACKENDS))
     for case_record in payload["cases"]:  # type: ignore[index]
         case = case_record["case"]
         backends = case_record["backends"]
@@ -414,7 +428,7 @@ def flatten_comparisons(payload: dict[str, object]) -> list[dict[str, object]]:
                 "case_id": case_record["case_id"],
                 "phase": phase_name,
             }
-            for backend in BACKENDS:
+            for backend in selected_backends:
                 backend_record = backends.get(backend, {})
                 row[f"{backend}_status"] = backend_record.get("status", "missing")
                 phase = backend_record.get("phases", {}).get(phase_name, {})
@@ -477,6 +491,8 @@ def _worker_command(
         str(args.kv_heads),
         "--head-dim",
         str(args.head_dim),
+        "--fixed-grid-size",
+        str(args.fixed_grid_size),
         "--dtype",
         args.dtype,
         "--anchor-distribution",
@@ -497,8 +513,8 @@ def _worker_command(
 def _parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=(
-            "Compare DFlash SDPA with baseline, two-anchor, and persistent "
-            "Triton forward/F+B performance."
+            "Compare DFlash SDPA with FlexAttention and all Triton "
+            "forward/F+B variants."
         )
     )
     parser.add_argument("--batch-sizes", default="1")
@@ -510,6 +526,8 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--query-heads", type=int, default=32)
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--fixed-grid-size", type=int, default=40)
+    parser.add_argument("--backends", default=",".join(BACKENDS))
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument(
         "--anchor-distribution", choices=("early", "uniform", "late"), default="uniform"
@@ -532,6 +550,8 @@ def _parser() -> argparse.ArgumentParser:
 def main() -> None:
     parser = _parser()
     args = parser.parse_args()
+    if args.fixed_grid_size <= 0:
+        parser.error("--fixed-grid-size must be positive")
     if args.worker_backend:
         if args.worker_output is None:
             parser.error("--worker-output is required with --worker-backend")
@@ -544,9 +564,16 @@ def main() -> None:
         )
         return
 
+    selected_backends = tuple(item for item in args.backends.split(",") if item)
+    unknown = set(selected_backends) - set(BACKENDS)
+    if unknown:
+        parser.error(f"unknown --backends: {sorted(unknown)}")
+    if not selected_backends or selected_backends[0] != "sdpa":
+        parser.error("--backends must start with sdpa")
+
     workers: dict[str, dict[str, object]] = {}
     with tempfile.TemporaryDirectory(prefix="dflash_sdpa_triton_") as temp_dir:
-        for backend in BACKENDS:
+        for backend in selected_backends:
             worker_output = Path(temp_dir) / f"{backend}.json"
             print(f"[compare] launching isolated {backend} worker", flush=True)
             subprocess.run(
@@ -556,7 +583,11 @@ def main() -> None:
             )
             workers[backend] = json.loads(worker_output.read_text(encoding="utf-8"))
 
-    payload = combine_worker_payloads(workers, command=" ".join(sys.argv))
+    payload = combine_worker_payloads(
+        workers,
+        command=" ".join(sys.argv),
+        backends=selected_backends,
+    )
     write_outputs(payload, args.output)
     print(f"[compare] wrote {args.output}", flush=True)
     print(f"[compare] wrote {args.output.with_suffix('.csv')}", flush=True)

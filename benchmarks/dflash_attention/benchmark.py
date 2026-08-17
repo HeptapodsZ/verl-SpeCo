@@ -46,6 +46,8 @@ BACKENDS = (
     "triton",
     "triton_two_anchor",
     "triton_persistent",
+    "triton_one_grid",
+    "triton_one_fixed_grid",
     "tilelang",
 )
 FORWARD_LIMITS = {
@@ -177,6 +179,8 @@ def backend_callable(
     backend: str,
     case: Case,
     inputs: Inputs,
+    *,
+    fixed_grid_size: int = 40,
 ) -> tuple[Callable[[torch.Tensor, torch.Tensor, torch.Tensor], torch.Tensor], int]:
     if backend == "flex":
         from torch.nn.attention.flex_attention import flex_attention
@@ -218,6 +222,8 @@ def backend_callable(
         "triton",
         "triton_two_anchor",
         "triton_persistent",
+        "triton_one_grid",
+        "triton_one_fixed_grid",
         "tilelang",
     ):
         raise ValueError(f"Unknown backend {backend!r}")
@@ -232,6 +238,7 @@ def backend_callable(
             ctx_len=case.context_len,
             block_size=case.block_size,
             backend=backend,
+            fixed_grid_size=fixed_grid_size,
         )
 
     metadata_bytes = sum(
@@ -518,7 +525,9 @@ def benchmark_backend(
     args: argparse.Namespace,
 ) -> dict:
     result: dict = {"backend": backend, "status": "running"}
-    call, mask_bytes = backend_callable(backend, case, inputs)
+    call, mask_bytes = backend_callable(
+        backend, case, inputs, fixed_grid_size=args.fixed_grid_size
+    )
     result["mask_or_metadata_mib"] = mask_bytes / 2**20
 
     query = inputs.query.detach().clone().requires_grad_(True)
@@ -705,6 +714,7 @@ def main() -> None:
     parser.add_argument("--query-heads", type=int, default=32)
     parser.add_argument("--kv-heads", type=int, default=8)
     parser.add_argument("--head-dim", type=int, default=128)
+    parser.add_argument("--fixed-grid-size", type=int, default=40)
     parser.add_argument("--dtype", choices=("bfloat16", "float16"), default="bfloat16")
     parser.add_argument(
         "--anchor-distribution", choices=("early", "uniform", "late"), default="uniform"
@@ -721,6 +731,8 @@ def main() -> None:
     args = parser.parse_args()
     if not torch.cuda.is_available():
         raise RuntimeError("The DFlashAttention benchmark requires CUDA")
+    if args.fixed_grid_size <= 0:
+        raise ValueError("--fixed-grid-size must be positive")
     backends = tuple(item for item in args.backends.split(",") if item)
     unknown = set(backends) - set(BACKENDS)
     if unknown:

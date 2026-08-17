@@ -16,11 +16,20 @@ DFLASH_ATTENTION_BACKENDS = frozenset(
         "triton",
         "triton_two_anchor",
         "triton_persistent",
+        "triton_one_grid",
+        "triton_one_fixed_grid",
         "tilelang",
     }
 )
 _CUSTOM_BACKENDS = frozenset(
-    {"triton", "triton_two_anchor", "triton_persistent", "tilelang"}
+    {
+        "triton",
+        "triton_two_anchor",
+        "triton_persistent",
+        "triton_one_grid",
+        "triton_one_fixed_grid",
+        "tilelang",
+    }
 )
 _SUPPORTED_BLOCK_SIZES = frozenset({16})
 _SUPPORTED_HEAD_DIMS = frozenset({64, 128})
@@ -86,6 +95,7 @@ def dflash_sparse_attention(
     ctx_len: int,
     block_size: int,
     backend: str,
+    fixed_grid_size: int = 40,
 ) -> torch.Tensor:
     """Run a custom DFlash attention backend with a shared autograd contract."""
     backend = str(backend).lower()
@@ -106,6 +116,8 @@ def dflash_sparse_attention(
             "triton": "baseline",
             "triton_two_anchor": "two_anchor",
             "triton_persistent": "persistent",
+            "triton_one_grid": "one_grid",
+            "triton_one_fixed_grid": "one_fixed_grid",
         }[backend]
         return triton_dflash_attention(
             query,
@@ -116,6 +128,7 @@ def dflash_sparse_attention(
             ctx_len=int(ctx_len),
             block_size=int(block_size),
             forward_variant=forward_variant,
+            fixed_grid_size=int(fixed_grid_size),
         )
 
     try:

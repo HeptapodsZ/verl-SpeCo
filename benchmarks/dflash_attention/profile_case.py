@@ -20,6 +20,8 @@ def main() -> None:
             "triton",
             "triton_two_anchor",
             "triton_persistent",
+            "triton_one_grid",
+            "triton_one_fixed_grid",
             "tilelang",
         ),
         required=True,
@@ -27,6 +29,7 @@ def main() -> None:
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--context-len", type=int, required=True)
     parser.add_argument("--block-size", type=int, required=True)
+    parser.add_argument("--fixed-grid-size", type=int, default=40)
     parser.add_argument("--iterations", type=int, default=20)
     parser.add_argument("--warmup", type=int, default=5)
     parser.add_argument(
@@ -37,7 +40,9 @@ def main() -> None:
     args = parser.parse_args()
     case = Case(args.batch_size, args.context_len, args.block_size)
     inputs = make_inputs(case, seed=0)
-    call, _ = backend_callable(args.backend, case, inputs)
+    call, _ = backend_callable(
+        args.backend, case, inputs, fixed_grid_size=args.fixed_grid_size
+    )
 
     def graph():
         query = inputs.query.detach().requires_grad_(True)

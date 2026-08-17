@@ -99,9 +99,16 @@ actor_rollout_ref:
         ttt_length: 1
         vocab_mapping_path: null
         dflash_block_size: 16
-        # auto preserves CUDA->FlexAttention and non-CUDA->SDPA. Triton and
-        # TileLang are explicit, fail-closed training-only alternatives.
+        # auto preserves CUDA->FlexAttention and non-CUDA->SDPA. Triton,
+        # triton_two_anchor, triton_persistent, triton_one_grid,
+        # triton_one_fixed_grid, and TileLang
+        # are explicit, fail-closed training-only alternatives. The Triton
+        # variants are experimental opt-ins; baseline triton remains the
+        # recommended path.
         dflash_attention_backend: auto
+        # gridDim.x for the triton_one_fixed_grid forward kernel. Each program
+        # consumes a grid-stride sequence of logical attention work items.
+        dflash_one_fixed_grid_size: 40
         dflash_num_anchors: 512
         dflash_loss_decay_gamma: 7.0
         dflash_front_position_weight: 1.0

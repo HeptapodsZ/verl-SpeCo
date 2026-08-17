@@ -10,14 +10,23 @@ from .reference import (
     dense_dflash_attention_reference,
     tensor_error_metrics,
 )
-from .tuning import current_device_profile, device_profile_registry
+from .tuning import (
+    DFlashKernelTuning,
+    current_device_profile,
+    device_profile_registry,
+    get_triton_backward_tuning,
+    get_triton_tuning,
+)
 
 __all__ = [
     "DFLASH_ATTENTION_BACKENDS",
+    "DFlashKernelTuning",
     "build_dflash_dense_attention_mask",
     "dense_dflash_attention_reference",
     "dflash_sparse_attention",
     "current_device_profile",
     "device_profile_registry",
+    "get_triton_backward_tuning",
+    "get_triton_tuning",
     "tensor_error_metrics",
 ]

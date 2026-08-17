@@ -47,10 +47,18 @@ def _forward_kernel(
     HEAD_CHUNKS: tl.constexpr,
     ACTIVE_ROWS: tl.constexpr,
     QUERY_ROWS: tl.constexpr,
+    ONE_GRID: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
 ):
-    anchor_id = tl.program_id(0)
-    batch_kv_chunk = tl.program_id(1)
+    # ONE_GRID is constexpr, so the unused 2-D mapping is removed from the
+    # triton_one_grid specialization rather than becoming a runtime branch.
+    if ONE_GRID:
+        work_id = tl.program_id(0)
+        anchor_id = work_id % NUM_ANCHORS
+        batch_kv_chunk = work_id // NUM_ANCHORS
+    else:
+        anchor_id = tl.program_id(0)
+        batch_kv_chunk = tl.program_id(1)
     batch_id = batch_kv_chunk // (HK * HEAD_CHUNKS)
     kv_chunk = batch_kv_chunk - batch_id * HK * HEAD_CHUNKS
     kv_head = kv_chunk // HEAD_CHUNKS
@@ -326,7 +334,7 @@ def _forward_two_anchor_kernel(
 
 
 @triton.jit
-def _forward_persistent_kernel(
+def _forward_grid_stride_kernel(
     Q,
     K,
     V,
@@ -352,12 +360,22 @@ def _forward_persistent_kernel(
     QUERY_ROWS: tl.constexpr,
     TOTAL_WORK: tl.constexpr,
     NUM_PROGRAMS: tl.constexpr,
+    ANCHOR_MAJOR: tl.constexpr,
     PIPELINE_STAGES: tl.constexpr,
 ):
     program_id = tl.program_id(0)
     for work_id in tl.range(program_id, TOTAL_WORK, NUM_PROGRAMS):
-        anchor_id = work_id % NUM_ANCHORS
-        batch_kv_chunk = work_id // NUM_ANCHORS
+        if ANCHOR_MAJOR:
+            # Fixed worker pools need each program to see anchors across the
+            # full cost range. Making the batch/KV/head chunk the fastest
+            # logical dimension avoids pinning a worker to one anchor residue
+            # class when NUM_PROGRAMS and NUM_ANCHORS have a common divisor.
+            batch_kv_chunks = TOTAL_WORK // NUM_ANCHORS
+            batch_kv_chunk = work_id % batch_kv_chunks
+            anchor_id = work_id // batch_kv_chunks
+        else:
+            anchor_id = work_id % NUM_ANCHORS
+            batch_kv_chunk = work_id // NUM_ANCHORS
         batch_id = batch_kv_chunk // (HK * HEAD_CHUNKS)
         kv_chunk = batch_kv_chunk - batch_id * HK * HEAD_CHUNKS
         kv_head = kv_chunk // HEAD_CHUNKS
@@ -518,9 +536,16 @@ def _backward_dq_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     GROUPS: tl.constexpr,
+    ONE_GRID: tl.constexpr,
 ):
-    anchor_id = tl.program_id(0)
-    batch_head = tl.program_id(1)
+    # Linearize (batch/query-head, anchor) without changing tile ownership.
+    if ONE_GRID:
+        work_id = tl.program_id(0)
+        anchor_id = work_id % NUM_ANCHORS
+        batch_head = work_id // NUM_ANCHORS
+    else:
+        anchor_id = tl.program_id(0)
+        batch_head = tl.program_id(1)
     batch_id = batch_head // HQ
     query_head = batch_head - batch_id * HQ
     kv_head = query_head // GROUPS
@@ -652,9 +677,18 @@ def _backward_dkv_context_kernel(
     BLOCK_M: tl.constexpr,
     BLOCK_N: tl.constexpr,
     GROUPS: tl.constexpr,
+    NUM_KEY_TILES: tl.constexpr,
+    ONE_GRID: tl.constexpr,
 ):
-    key_tile = tl.program_id(0)
-    batch_kv_head = tl.program_id(1)
+    # Linearize (batch/KV-head, context-key-tile). Each program still owns one
+    # complete DK/DV tile, so the pull reduction remains free of atomics.
+    if ONE_GRID:
+        work_id = tl.program_id(0)
+        key_tile = work_id % NUM_KEY_TILES
+        batch_kv_head = work_id // NUM_KEY_TILES
+    else:
+        key_tile = tl.program_id(0)
+        batch_kv_head = tl.program_id(1)
     batch_id = batch_kv_head // HK
     kv_head = batch_kv_head - batch_id * HK
     offs_n = key_tile * BLOCK_N + tl.arange(0, BLOCK_N)
@@ -743,9 +777,16 @@ def _backward_dkv_draft_kernel(
     HEAD_DIM: tl.constexpr,
     BLOCK_M: tl.constexpr,
     GROUPS: tl.constexpr,
+    ONE_GRID: tl.constexpr,
 ):
-    anchor_id = tl.program_id(0)
-    batch_kv_head = tl.program_id(1)
+    # Linearize (batch/KV-head, draft-anchor) with one writer per DK/DV tile.
+    if ONE_GRID:
+        work_id = tl.program_id(0)
+        anchor_id = work_id % NUM_ANCHORS
+        batch_kv_head = work_id // NUM_ANCHORS
+    else:
+        anchor_id = tl.program_id(0)
+        batch_kv_head = tl.program_id(1)
     batch_id = batch_kv_head // HK
     kv_head = batch_kv_head - batch_id * HK
     offs_m = tl.arange(0, BLOCK_M)
@@ -844,10 +885,21 @@ def triton_dflash_attention_forward(
     ctx_len: int,
     block_size: int,
     forward_variant: str = "baseline",
+    fixed_grid_size: int = 40,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch the Triton forward kernel and return output plus natural-log LSE."""
-    if forward_variant not in ("baseline", "two_anchor", "persistent"):
+    if forward_variant not in (
+        "baseline",
+        "two_anchor",
+        "persistent",
+        "one_grid",
+        "one_fixed_grid",
+    ):
         raise ValueError(f"Unknown DFlash Triton forward variant {forward_variant!r}")
+    if forward_variant == "one_fixed_grid" and int(fixed_grid_size) <= 0:
+        raise ValueError(
+            f"DFlash one_fixed_grid size must be positive, got {fixed_grid_size}"
+        )
     bsz, num_query_heads, query_len, head_dim = query.shape
     num_kv_heads = key.shape[1]
     num_anchors = anchor_positions.shape[1]
@@ -895,7 +947,23 @@ def triton_dflash_attention_forward(
     )
     batch_kv_chunks = bsz * num_kv_heads * head_chunks
     if forward_variant == "baseline":
-        _forward_kernel[(num_anchors, batch_kv_chunks)](*common_args, **common_meta)
+        _forward_kernel[(num_anchors, batch_kv_chunks)](
+            *common_args, **common_meta, ONE_GRID=False
+        )
+    elif forward_variant == "one_grid":
+        _forward_kernel[(num_anchors * batch_kv_chunks,)](
+            *common_args, **common_meta, ONE_GRID=True
+        )
+    elif forward_variant == "one_fixed_grid":
+        total_work = num_anchors * batch_kv_chunks
+        num_programs = int(fixed_grid_size)
+        _forward_grid_stride_kernel[(num_programs,)](
+            *common_args,
+            **common_meta,
+            TOTAL_WORK=total_work,
+            NUM_PROGRAMS=num_programs,
+            ANCHOR_MAJOR=True,
+        )
     elif forward_variant == "two_anchor":
         anchors_per_program = 2
         two_anchor_active_rows = active_rows * anchors_per_program
@@ -915,11 +983,12 @@ def triton_dflash_attention_forward(
         # 1024-work-item grid to a persistent queue of 168 CTAs on RTX 5080.
         num_programs = min(total_work, sm_count * 2)
         persistent_meta = dict(common_meta)
-        _forward_persistent_kernel[(num_programs,)](
+        _forward_grid_stride_kernel[(num_programs,)](
             *common_args,
             **persistent_meta,
             TOTAL_WORK=total_work,
             NUM_PROGRAMS=num_programs,
+            ANCHOR_MAJOR=False,
         )
     return output, lse
 
@@ -936,6 +1005,7 @@ def _triton_backward(
     *,
     ctx_len: int,
     block_size: int,
+    one_grid: bool,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     grad_output = grad_output.contiguous()
     bsz, num_query_heads, query_len, head_dim = query.shape
@@ -949,7 +1019,11 @@ def _triton_backward(
     grad_query = torch.empty_like(query)
     grad_key = torch.empty_like(key)
     grad_value = torch.empty_like(value)
-    grid_qa = (num_anchors, bsz * num_query_heads)
+    grid_qa = (
+        (num_anchors * bsz * num_query_heads,)
+        if one_grid
+        else (num_anchors, bsz * num_query_heads)
+    )
     _backward_dq_kernel[grid_qa](
         query,
         key,
@@ -973,13 +1047,18 @@ def _triton_backward(
         BLOCK_M=block_m,
         BLOCK_N=block_n,
         GROUPS=groups,
+        ONE_GRID=one_grid,
         num_warps=num_warps,
         num_stages=num_stages,
     )
     if ctx_len > 0:
-        _backward_dkv_context_kernel[
-            (triton.cdiv(ctx_len, block_n), bsz * num_kv_heads)
-        ](
+        num_key_tiles = triton.cdiv(ctx_len, block_n)
+        context_grid = (
+            (num_key_tiles * bsz * num_kv_heads,)
+            if one_grid
+            else (num_key_tiles, bsz * num_kv_heads)
+        )
+        _backward_dkv_context_kernel[context_grid](
             query,
             key,
             value,
@@ -1002,10 +1081,17 @@ def _triton_backward(
             BLOCK_M=block_m,
             BLOCK_N=block_n,
             GROUPS=groups,
+            NUM_KEY_TILES=num_key_tiles,
+            ONE_GRID=one_grid,
             num_warps=num_warps,
             num_stages=num_stages,
         )
-    _backward_dkv_draft_kernel[(num_anchors, bsz * num_kv_heads)](
+    draft_grid = (
+        (num_anchors * bsz * num_kv_heads,)
+        if one_grid
+        else (num_anchors, bsz * num_kv_heads)
+    )
+    _backward_dkv_draft_kernel[draft_grid](
         query,
         key,
         value,
@@ -1026,6 +1112,7 @@ def _triton_backward(
         HEAD_DIM=head_dim,
         BLOCK_M=block_m,
         GROUPS=groups,
+        ONE_GRID=one_grid,
         num_warps=num_warps,
     )
     return grad_query, grad_key, grad_value
@@ -1043,6 +1130,7 @@ class _TritonDFlashAttention(torch.autograd.Function):
         ctx_len: int,
         block_size: int,
         forward_variant: str,
+        fixed_grid_size: int,
     ) -> torch.Tensor:
         output, lse = triton_dflash_attention_forward(
             query,
@@ -1053,6 +1141,7 @@ class _TritonDFlashAttention(torch.autograd.Function):
             ctx_len=int(ctx_len),
             block_size=int(block_size),
             forward_variant=str(forward_variant),
+            fixed_grid_size=int(fixed_grid_size),
         )
         ctx.save_for_backward(
             query,
@@ -1065,6 +1154,7 @@ class _TritonDFlashAttention(torch.autograd.Function):
         )
         ctx.ctx_len = int(ctx_len)
         ctx.block_size = int(block_size)
+        ctx.one_grid = str(forward_variant) in ("one_grid", "one_fixed_grid")
         return output
 
     @staticmethod
@@ -1083,8 +1173,9 @@ class _TritonDFlashAttention(torch.autograd.Function):
             block_keep_mask,
             ctx_len=ctx.ctx_len,
             block_size=ctx.block_size,
+            one_grid=ctx.one_grid,
         )
-        return grad_query, grad_key, grad_value, None, None, None, None, None
+        return grad_query, grad_key, grad_value, None, None, None, None, None, None
 
 
 def triton_dflash_attention(
@@ -1097,6 +1188,7 @@ def triton_dflash_attention(
     ctx_len: int,
     block_size: int,
     forward_variant: str = "baseline",
+    fixed_grid_size: int = 40,
 ) -> torch.Tensor:
     return _TritonDFlashAttention.apply(
         query,
@@ -1107,4 +1199,5 @@ def triton_dflash_attention(
         int(ctx_len),
         int(block_size),
         str(forward_variant),
+        int(fixed_grid_size),
     )
