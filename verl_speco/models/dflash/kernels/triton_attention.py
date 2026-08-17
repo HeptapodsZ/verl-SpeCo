@@ -856,21 +856,57 @@ def _forward_launch_config(
     ctx_len: int,
     device: torch.device,
     forward_variant: str,
+    *,
+    batch_size: int,
+    num_anchors: int,
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    dtype: str,
+    fixed_grid_size: int,
 ) -> tuple[int, int, int, int]:
     config = get_triton_tuning(
         forward_variant=forward_variant,
         block_size=block_size,
         ctx_len=ctx_len,
         device=device,
+        batch_size=batch_size,
+        num_anchors=num_anchors,
+        query_heads=query_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        fixed_grid_size=fixed_grid_size,
     )
     return config.block_m, config.block_n, config.num_warps, config.num_stages
 
 
 def _backward_launch_config(
-    block_size: int, ctx_len: int, device: torch.device
+    block_size: int,
+    ctx_len: int,
+    device: torch.device,
+    forward_variant: str,
+    *,
+    batch_size: int,
+    num_anchors: int,
+    query_heads: int,
+    kv_heads: int,
+    head_dim: int,
+    dtype: str,
+    fixed_grid_size: int,
 ) -> tuple[int, int, int, int]:
     config = get_triton_backward_tuning(
-        block_size=block_size, ctx_len=ctx_len, device=device
+        block_size=block_size,
+        ctx_len=ctx_len,
+        device=device,
+        forward_variant=forward_variant,
+        batch_size=batch_size,
+        num_anchors=num_anchors,
+        query_heads=query_heads,
+        kv_heads=kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        fixed_grid_size=fixed_grid_size,
     )
     return config.block_m, config.block_n, config.num_warps, config.num_stages
 
@@ -903,8 +939,19 @@ def triton_dflash_attention_forward(
     bsz, num_query_heads, query_len, head_dim = query.shape
     num_kv_heads = key.shape[1]
     num_anchors = anchor_positions.shape[1]
+    dtype_name = str(query.dtype).removeprefix("torch.")
     block_m, block_n, num_warps, num_stages = _forward_launch_config(
-        block_size, ctx_len, query.device, forward_variant
+        block_size,
+        ctx_len,
+        query.device,
+        forward_variant,
+        batch_size=bsz,
+        num_anchors=num_anchors,
+        query_heads=num_query_heads,
+        kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype_name,
+        fixed_grid_size=int(fixed_grid_size),
     )
     groups = num_query_heads // num_kv_heads
     heads_per_program = min(2, groups)
@@ -1005,15 +1052,28 @@ def _triton_backward(
     *,
     ctx_len: int,
     block_size: int,
-    one_grid: bool,
+    forward_variant: str,
+    fixed_grid_size: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     grad_output = grad_output.contiguous()
     bsz, num_query_heads, query_len, head_dim = query.shape
     num_kv_heads = key.shape[1]
     num_anchors = anchor_positions.shape[1]
     groups = num_query_heads // num_kv_heads
+    one_grid = forward_variant in ("one_grid", "one_fixed_grid")
+    dtype_name = str(query.dtype).removeprefix("torch.")
     block_m, block_n, num_warps, num_stages = _backward_launch_config(
-        block_size, ctx_len, query.device
+        block_size,
+        ctx_len,
+        query.device,
+        forward_variant,
+        batch_size=bsz,
+        num_anchors=num_anchors,
+        query_heads=num_query_heads,
+        kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype_name,
+        fixed_grid_size=int(fixed_grid_size),
     )
     delta = torch.empty_like(lse)
     grad_query = torch.empty_like(query)
@@ -1154,7 +1214,8 @@ class _TritonDFlashAttention(torch.autograd.Function):
         )
         ctx.ctx_len = int(ctx_len)
         ctx.block_size = int(block_size)
-        ctx.one_grid = str(forward_variant) in ("one_grid", "one_fixed_grid")
+        ctx.forward_variant = str(forward_variant)
+        ctx.fixed_grid_size = int(fixed_grid_size)
         return output
 
     @staticmethod
@@ -1173,7 +1234,8 @@ class _TritonDFlashAttention(torch.autograd.Function):
             block_keep_mask,
             ctx_len=ctx.ctx_len,
             block_size=ctx.block_size,
-            one_grid=ctx.one_grid,
+            forward_variant=ctx.forward_variant,
+            fixed_grid_size=ctx.fixed_grid_size,
         )
         return grad_query, grad_key, grad_value, None, None, None, None, None, None
 
