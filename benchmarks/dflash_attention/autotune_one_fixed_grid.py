@@ -13,7 +13,9 @@ This script deliberately focuses on one kernel and one forward backend:
 selected output is then checked against PyTorch SDPA using the exact dense
 DFlash mask.  This is a teaching example, not the production offline tuner in
 ``tune_triton.py``: autotune chooses by latency first, and the SDPA correctness
-gate is applied to the winning configuration afterwards.
+gate is applied to the winning configuration afterwards.  The script also
+compares the winning backend call with SDPA for CUDA-event latency and peak
+allocated memory.
 
 Run from the repository root under the project WSL environment, for example:
 
@@ -29,6 +31,7 @@ Use smaller values for a quick demonstration:
 from __future__ import annotations
 
 import argparse
+import gc
 import math
 import statistics
 import sys
@@ -242,6 +245,51 @@ def measure_cuda_ms(call, *, warmup: int, iterations: int, rounds: int) -> dict[
     return {"p50_ms": statistics.median(samples), "round_ms": samples}
 
 
+def measure_cuda_memory(call) -> dict[str, float]:
+    """Measure one forward call after clearing unoccupied CUDA cache blocks."""
+    torch.cuda.synchronize()
+    gc.collect()
+    torch.cuda.empty_cache()
+    baseline_allocated = torch.cuda.memory_allocated()
+    baseline_reserved = torch.cuda.memory_reserved()
+    torch.cuda.reset_peak_memory_stats()
+
+    value = call()
+    torch.cuda.synchronize()
+    peak_allocated = torch.cuda.max_memory_allocated()
+    peak_reserved = torch.cuda.max_memory_reserved()
+    del value
+    torch.cuda.synchronize()
+
+    mib = float(2**20)
+    return {
+        "baseline_allocated_mib": baseline_allocated / mib,
+        "baseline_reserved_mib": baseline_reserved / mib,
+        "peak_allocated_mib": peak_allocated / mib,
+        "peak_reserved_mib": peak_reserved / mib,
+        "peak_allocated_delta_mib": (peak_allocated - baseline_allocated) / mib,
+        "peak_reserved_delta_mib": (peak_reserved - baseline_reserved) / mib,
+    }
+
+
+def sdpa_forward(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    dense_mask: torch.Tensor,
+) -> torch.Tensor:
+    """Run the SDPA backend with resident mask and measured GQA expansion."""
+    groups = query.shape[1] // key.shape[1]
+    return F.scaled_dot_product_attention(
+        query,
+        key.repeat_interleave(groups, dim=1),
+        value.repeat_interleave(groups, dim=1),
+        attn_mask=dense_mask,
+        dropout_p=0.0,
+        is_causal=False,
+    )
+
+
 def sdpa_reference(
     query: torch.Tensor,
     key: torch.Tensor,
@@ -252,18 +300,10 @@ def sdpa_reference(
     context_len: int,
 ) -> torch.Tensor:
     """Run SDPA with the same prefix/local-block/dummy-self attention mask."""
-    groups = query.shape[1] // key.shape[1]
     dense_mask = build_dflash_dense_attention_mask(
         anchors, keep.bool(), context_len, BLOCK_SIZE
     )
-    return F.scaled_dot_product_attention(
-        query,
-        key.repeat_interleave(groups, dim=1),
-        value.repeat_interleave(groups, dim=1),
-        attn_mask=dense_mask,
-        dropout_p=0.0,
-        is_causal=False,
-    )
+    return sdpa_forward(query, key, value, dense_mask)
 
 
 def accuracy_metrics(
@@ -352,14 +392,38 @@ def main() -> None:
 
     with torch.no_grad():
         # The first call benchmarks all candidates.  A second call uses the
-        # cached winner and leaves output/LSE populated by that winner.
+        # cached winner.
         launch(kernel, query, key, value, anchors, keep, context_len=args.context_len)
+        launch(kernel, query, key, value, anchors, keep, context_len=args.context_len)
+
+        # Backend-comparison calls include output allocation.  The tuned path
+        # is measured before constructing SDPA's dense mask so its absolute
+        # peak does not include memory owned only by the comparison backend.
+        def tuned_backend_call():
+            return launch(
+                kernel,
+                query,
+                key,
+                value,
+                anchors,
+                keep,
+                context_len=args.context_len,
+            )
+
+        tuned_memory = measure_cuda_memory(tuned_backend_call)
+
+        dense_mask = build_dflash_dense_attention_mask(
+            anchors, keep.bool(), args.context_len, BLOCK_SIZE
+        )
+        def sdpa_call():
+            return sdpa_forward(query, key, value, dense_mask)
+
+        sdpa_memory = measure_cuda_memory(sdpa_call)
+
         output, _ = launch(
             kernel, query, key, value, anchors, keep, context_len=args.context_len
         )
-        reference = sdpa_reference(
-            query, key, value, anchors, keep, context_len=args.context_len
-        )
+        reference = sdpa_call()
         torch.cuda.synchronize()
 
         metrics = accuracy_metrics(
@@ -417,6 +481,18 @@ def main() -> None:
             iterations=args.iterations,
             rounds=args.rounds,
         )
+        tuned_backend_timing = measure_cuda_ms(
+            tuned_backend_call,
+            warmup=args.warmup,
+            iterations=args.iterations,
+            rounds=args.rounds,
+        )
+        sdpa_timing = measure_cuda_ms(
+            sdpa_call,
+            warmup=args.warmup,
+            iterations=args.iterations,
+            rounds=args.rounds,
+        )
 
     best = kernel.best_config
     print("\nBest triton.Config:")
@@ -437,6 +513,36 @@ def main() -> None:
     print(f"  speedup:  {baseline_ms / tuned_ms:.4f}x")
     print(f"  baseline rounds: {baseline_timing['round_ms']}")
     print(f"  tuned rounds:    {tuned_timing['round_ms']}")
+
+    tuned_backend_ms = float(tuned_backend_timing["p50_ms"])
+    sdpa_ms = float(sdpa_timing["p50_ms"])
+    tuned_peak_mib = float(tuned_memory["peak_allocated_mib"])
+    sdpa_peak_mib = float(sdpa_memory["peak_allocated_mib"])
+    tuned_peak_delta_mib = float(tuned_memory["peak_allocated_delta_mib"])
+    sdpa_peak_delta_mib = float(sdpa_memory["peak_allocated_delta_mib"])
+    print("\nBest config vs SDPA backend forward:")
+    print("  calls allocate outputs; latency is CUDA-event device time")
+    print("  SDPA dense mask is resident; GQA K/V expansion is measured")
+    print(
+        "  tuned best: "
+        f"{tuned_backend_ms:.6f} ms, "
+        f"peak allocated={tuned_peak_mib:.3f} MiB, "
+        f"call delta={tuned_peak_delta_mib:.3f} MiB"
+    )
+    print(
+        "  SDPA:       "
+        f"{sdpa_ms:.6f} ms, "
+        f"peak allocated={sdpa_peak_mib:.3f} MiB, "
+        f"call delta={sdpa_peak_delta_mib:.3f} MiB"
+    )
+    print(f"  latency speedup (SDPA / tuned): {sdpa_ms / tuned_backend_ms:.4f}x")
+    print(f"  peak allocated saving:          {sdpa_peak_mib - tuned_peak_mib:.3f} MiB")
+    print(
+        "  peak allocated reduction:       "
+        f"{1.0 - tuned_peak_mib / sdpa_peak_mib:.2%}"
+    )
+    print(f"  tuned backend rounds: {tuned_backend_timing['round_ms']}")
+    print(f"  SDPA rounds:          {sdpa_timing['round_ms']}")
 
     if not metrics["allclose"]:
         raise AssertionError(

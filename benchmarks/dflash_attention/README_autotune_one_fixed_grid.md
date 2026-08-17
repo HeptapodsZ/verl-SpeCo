@@ -11,8 +11,8 @@ dispatcher, model, backward kernels, or production tuning profiles.
 
 | File | Purpose |
 |---|---|
-| `benchmarks/dflash_attention/autotune_one_fixed_grid.py` | Imports the real `_forward_grid_stride_kernel`, wraps it with `triton.autotune`, builds representative contiguous DFlash inputs, launches only the `one_fixed_grid` mapping, checks the selected output against SDPA, and measures production-default baseline versus the autotuned winner. |
-| `benchmarks/dflash_attention/run_autotune_one_fixed_grid.sh` | Enters the repository, activates the required WSL CUDA/Triton environment, removes any external production tuning-profile override, and runs the experiment. Extra CLI arguments are forwarded to the Python script. |
+| `benchmarks/dflash_attention/autotune_one_fixed_grid.py` | Imports the real `_forward_grid_stride_kernel`, wraps it with `triton.autotune`, builds representative contiguous DFlash inputs, launches only the `one_fixed_grid` mapping, checks the selected output against SDPA, measures production-default baseline versus the autotuned winner, and compares the winner with the SDPA backend for latency and peak allocated memory. |
+| `benchmarks/dflash_attention/run_autotune_one_fixed_grid.sh` | Enters the repository, activates the required WSL CUDA/Triton environment, removes any external production tuning-profile override, and runs both comparisons. Extra CLI arguments are forwarded to the Python script. |
 | `benchmarks/dflash_attention/README_autotune_one_fixed_grid.md` | Records the implementation, methodology, measured result, limitations, and exact reproduction command. |
 
 ### Autotune space
@@ -75,30 +75,63 @@ Hq/Hkv:         32/8
 Head dimension: 128
 Dtype:          bfloat16
 Anchor layout:  uniformly spaced sorted anchors; first block is dummy
-Warmup:         10 launches
+Warmup:         10 launches per latency path
 Measurement:    5 CUDA Event rounds, 100 launches per round
-Allocation:     O and LSE preallocated outside measured regions
+Kernel timing:  O and LSE preallocated outside measured regions
+Backend calls:  output allocation performed inside each call
 ```
 
 Compilation and autotune search time are excluded from the reported steady-state
 kernel latency. Baseline and tuned use identical tensors, output buffers, timing
 code, and `ANCHOR_MAJOR=True` mapping.
 
+The best-config-versus-SDPA comparison invokes complete attention backend calls.
+The tuned call allocates O and LSE. The SDPA dense boolean mask is constructed
+once and remains resident, while GQA K/V `repeat_interleave` and SDPA's output and
+workspace allocations remain inside the call. Latency is CUDA-event device time,
+so Python dispatch and host-side allocator overhead are not included. Peak memory is
+`torch.cuda.max_memory_allocated()` for one forward after synchronization, Python
+GC, `torch.cuda.empty_cache()`, and reset of peak statistics. Resident Q/K/V and
+backend structural data are included; the per-call delta is also reported. The
+tuned peak is measured before the SDPA-only dense mask is materialized.
+
 ### Baseline versus tuned
 
 | Variant | `BLOCK_N` | Warps | Stages | Programs | Forward p50 | Speedup |
 |---|---:|---:|---:|---:|---:|---:|
-| Production-default baseline | 64 | 4 | 2 | 40 | 0.217265 ms | 1.0000x |
-| `triton.autotune` winner | 64 | 4 | 2 | 80 | 0.122127 ms | **1.7790x** |
+| Production-default baseline | 64 | 4 | 2 | 40 | 0.218270 ms | 1.0000x |
+| `triton.autotune` winner | 64 | 4 | 2 | 80 | 0.127229 ms | **1.7156x** |
 
 Raw per-round means in milliseconds:
 
 ```text
 baseline:
-  0.2172649574, 0.2106851196, 0.2182959938, 0.2164678383, 0.2189423943
+  0.2182697678, 0.2203727913, 0.2168611145, 0.2204118347, 0.2136617661
 
 tuned:
-  0.1217712021, 0.1221273613, 0.1267084789, 0.1224342442, 0.1163779163
+  0.1171001625, 0.1272288036, 0.1284825611, 0.1283513641, 0.1260803223
+```
+
+### Autotuned best config versus SDPA
+
+This backend-call comparison is intentionally separate from the preallocated
+kernel-only table above. Allocations made by each call are captured by the memory
+metric; latency remains CUDA-event device time.
+
+| Backend | Forward p50 | Relative latency | Peak allocated | Per-call peak delta |
+|---|---:|---:|---:|---:|
+| Autotuned `one_fixed_grid` best | 0.139421 ms | 1.0000x | 22.126 MiB | 8.125 MiB |
+| PyTorch SDPA | 0.979469 ms | 7.0252x slower | 50.501 MiB | 35.000 MiB |
+
+For this workload, the tuned backend is **7.0252x faster** than SDPA and lowers
+peak allocated memory by **28.375 MiB (56.19%)**. Raw per-round latency means:
+
+```text
+tuned best:
+  0.1401276779, 0.1483676815, 0.1394214439, 0.1373043156, 0.1256886387
+
+SDPA:
+  0.9250201416, 0.9794694519, 0.9981839752, 0.9987609863, 0.9367225647
 ```
 
 The selected kernel passed the SDPA output gate:
@@ -118,9 +151,10 @@ training, or end-to-end RLHF throughput.
 
 ## 3. Reproduction
 
-Run from Windows through WSL, or from an existing WSL shell. The wrapper locates
-the repository relative to itself and activates the workspace-required virtual
-environment:
+Run from Windows through WSL, or from an existing WSL shell. The executable
+wrapper `benchmarks/dflash_attention/run_autotune_one_fixed_grid.sh` locates the
+repository relative to itself, activates the workspace-required virtual
+environment, and reports both baseline-vs-tuned and tuned-best-vs-SDPA results:
 
 ```bash
 cd /mnt/d/Code_projects/VeRL/verl_speco/verl-SpeCo
