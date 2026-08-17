@@ -12,15 +12,20 @@ from .reference import (
 )
 from .tuning import (
     DFlashKernelTuning,
+    DFlashTuningKey,
     current_device_profile,
     device_profile_registry,
     get_triton_backward_tuning,
     get_triton_tuning,
+    override_triton_tuning,
+    triton_tuning_candidates,
+    validate_triton_tuning,
 )
 
 __all__ = [
     "DFLASH_ATTENTION_BACKENDS",
     "DFlashKernelTuning",
+    "DFlashTuningKey",
     "build_dflash_dense_attention_mask",
     "dense_dflash_attention_reference",
     "dflash_sparse_attention",
@@ -28,5 +33,8 @@ __all__ = [
     "device_profile_registry",
     "get_triton_backward_tuning",
     "get_triton_tuning",
+    "override_triton_tuning",
     "tensor_error_metrics",
+    "triton_tuning_candidates",
+    "validate_triton_tuning",
 ]
