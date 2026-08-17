@@ -30,6 +30,7 @@ from __future__ import annotations
 
 import argparse
 import math
+import statistics
 import sys
 from pathlib import Path
 
@@ -165,6 +166,8 @@ def launch(
     keep: torch.Tensor,
     *,
     context_len: int,
+    output: torch.Tensor | None = None,
+    lse: torch.Tensor | None = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Launch exactly the production ``one_fixed_grid`` mapping."""
     batch_size, query_heads, query_len, head_dim = query.shape
@@ -178,14 +181,16 @@ def launch(
     batch_kv_chunks = batch_size * kv_heads * head_chunks
     total_work = num_anchors * batch_kv_chunks
 
-    output = torch.empty_like(query)
-    lse = torch.empty(
-        batch_size,
-        query_heads,
-        query_len,
-        device=query.device,
-        dtype=torch.float32,
-    )
+    if output is None:
+        output = torch.empty_like(query)
+    if lse is None:
+        lse = torch.empty(
+            batch_size,
+            query_heads,
+            query_len,
+            device=query.device,
+            dtype=torch.float32,
+        )
 
     # NUM_PROGRAMS comes from each triton.Config, so the launch grid and the
     # grid-stride step always agree for that candidate.
@@ -216,6 +221,25 @@ def launch(
         ANCHOR_MAJOR=True,
     )
     return output, lse
+
+
+def measure_cuda_ms(call, *, warmup: int, iterations: int, rounds: int) -> dict[str, object]:
+    """Measure steady-state latency with CUDA Events and report round medians."""
+    for _ in range(warmup):
+        call()
+    torch.cuda.synchronize()
+
+    samples = []
+    for _ in range(rounds):
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(iterations):
+            call()
+        end.record()
+        end.synchronize()
+        samples.append(start.elapsed_time(end) / iterations)
+    return {"p50_ms": statistics.median(samples), "round_ms": samples}
 
 
 def sdpa_reference(
@@ -276,6 +300,10 @@ def validate_args(args: argparse.Namespace) -> None:
         raise ValueError("stage-counts may contain only 1, 2, 3, or 4")
     if any(value < 16 or value & (value - 1) for value in args.block_ns):
         raise ValueError("block-ns must contain powers of two >= 16")
+    if args.baseline_grid_size <= 0:
+        raise ValueError("baseline-grid-size must be positive")
+    if args.warmup < 0 or args.iterations <= 0 or args.rounds <= 0:
+        raise ValueError("warmup must be nonnegative; iterations and rounds must be positive")
 
 
 def parse_args() -> argparse.Namespace:
@@ -294,6 +322,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--grid-sizes", type=parse_int_list, default=parse_int_list("40,80"))
     parser.add_argument("--atol", type=float, default=2e-2)
     parser.add_argument("--rtol", type=float, default=2e-2)
+    parser.add_argument("--baseline-grid-size", type=int, default=40)
+    parser.add_argument("--warmup", type=int, default=10)
+    parser.add_argument("--iterations", type=int, default=100)
+    parser.add_argument("--rounds", type=int, default=5)
     return parser.parse_args()
 
 
@@ -307,6 +339,7 @@ def main() -> None:
         args.stage_counts,
         args.grid_sizes,
     )
+    baseline_kernel = make_autotuned_kernel([64], [4], [2], [args.baseline_grid_size])
 
     print(f"GPU: {torch.cuda.get_device_name(query.device)}")
     print(
@@ -333,6 +366,58 @@ def main() -> None:
             output, reference, atol=args.atol, rtol=args.rtol
         )
 
+        # Compile the one-config production baseline, then measure both paths
+        # with preallocated outputs so allocation time is excluded equally.
+        baseline_output = torch.empty_like(query)
+        baseline_lse = torch.empty_like(output[..., 0], dtype=torch.float32)
+        tuned_output = torch.empty_like(query)
+        tuned_lse = torch.empty_like(output[..., 0], dtype=torch.float32)
+        launch(
+            baseline_kernel,
+            query,
+            key,
+            value,
+            anchors,
+            keep,
+            context_len=args.context_len,
+            output=baseline_output,
+            lse=baseline_lse,
+        )
+        torch.cuda.synchronize()
+
+        baseline_timing = measure_cuda_ms(
+            lambda: launch(
+                baseline_kernel,
+                query,
+                key,
+                value,
+                anchors,
+                keep,
+                context_len=args.context_len,
+                output=baseline_output,
+                lse=baseline_lse,
+            ),
+            warmup=args.warmup,
+            iterations=args.iterations,
+            rounds=args.rounds,
+        )
+        tuned_timing = measure_cuda_ms(
+            lambda: launch(
+                kernel,
+                query,
+                key,
+                value,
+                anchors,
+                keep,
+                context_len=args.context_len,
+                output=tuned_output,
+                lse=tuned_lse,
+            ),
+            warmup=args.warmup,
+            iterations=args.iterations,
+            rounds=args.rounds,
+        )
+
     best = kernel.best_config
     print("\nBest triton.Config:")
     print(f"  kwargs={best.kwargs}")
@@ -340,6 +425,18 @@ def main() -> None:
     print("\nAccuracy vs SDPA:")
     for name, value in metrics.items():
         print(f"  {name}: {value}")
+    baseline_ms = float(baseline_timing["p50_ms"])
+    tuned_ms = float(tuned_timing["p50_ms"])
+    print("\nBaseline vs tuned forward (CUDA Event p50):")
+    print(
+        "  baseline: "
+        f"{baseline_ms:.6f} ms "
+        f"(BN=64, warps=4, stages=2, grid={args.baseline_grid_size})"
+    )
+    print(f"  tuned:    {tuned_ms:.6f} ms")
+    print(f"  speedup:  {baseline_ms / tuned_ms:.4f}x")
+    print(f"  baseline rounds: {baseline_timing['round_ms']}")
+    print(f"  tuned rounds:    {tuned_timing['round_ms']}")
 
     if not metrics["allclose"]:
         raise AssertionError(
