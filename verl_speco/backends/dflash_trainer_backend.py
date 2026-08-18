@@ -351,6 +351,7 @@ class DFlashTrainingModel(nn.Module):
             "triton_persistent",
             "triton_one_grid",
             "triton_one_fixed_grid",
+            "triton_npu_v1",
             "tilelang",
         )
         draft_hidden = self.draft_model(

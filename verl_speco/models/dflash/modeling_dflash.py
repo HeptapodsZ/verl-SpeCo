@@ -206,6 +206,7 @@ class DFlashAttention(nn.Module):
             "triton_persistent",
             "triton_one_grid",
             "triton_one_fixed_grid",
+            "triton_npu_v1",
             "tilelang",
         ):
             if (

@@ -104,7 +104,8 @@ actor_rollout_ref:
         # triton_one_fixed_grid, and TileLang
         # are explicit, fail-closed training-only alternatives. The Triton
         # variants are experimental opt-ins; baseline triton remains the
-        # recommended path.
+        # recommended path. triton_npu_v1 is a forward-only Triton-Ascend
+        # backend for Ascend NPU (backward not implemented).
         dflash_attention_backend: auto
         # gridDim.x for the triton_one_fixed_grid forward kernel. Each program
         # consumes a grid-stride sequence of logical attention work items.

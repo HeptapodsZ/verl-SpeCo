@@ -18,6 +18,7 @@ DFLASH_ATTENTION_BACKENDS = frozenset(
         "triton_persistent",
         "triton_one_grid",
         "triton_one_fixed_grid",
+        "triton_npu_v1",
         "tilelang",
     }
 )
@@ -28,6 +29,7 @@ _CUSTOM_BACKENDS = frozenset(
         "triton_persistent",
         "triton_one_grid",
         "triton_one_fixed_grid",
+        "triton_npu_v1",
         "tilelang",
     }
 )
@@ -44,8 +46,11 @@ def _validate_custom_inputs(
     ctx_len: int,
     block_size: int,
 ) -> None:
-    if not query.is_cuda:
-        raise RuntimeError("DFlash Triton/TileLang attention requires CUDA tensors")
+    if query.device.type not in ("cuda", "npu"):
+        raise RuntimeError(
+            "DFlash custom attention requires CUDA or NPU (Ascend) tensors, "
+            f"got device type {query.device.type!r}"
+        )
     if key.device != query.device or value.device != query.device:
         raise ValueError("DFlash custom attention requires Q/K/V on the same device")
     if query.dtype not in (torch.float16, torch.bfloat16):
@@ -109,6 +114,23 @@ def dflash_sparse_attention(
     value = value.contiguous()
     anchors_i32 = anchor_positions.to(dtype=torch.int32).contiguous()
     keep_i32 = block_keep_mask.to(dtype=torch.int32).contiguous()
+    if backend == "triton_npu_v1":
+        if query.device.type != "npu":
+            raise RuntimeError(
+                "DFlash triton_npu_v1 backend requires NPU (Ascend) tensors, "
+                f"got device type {query.device.type!r}"
+            )
+        from .triton_npu_attention import triton_npu_dflash_attention
+
+        return triton_npu_dflash_attention(
+            query,
+            key,
+            value,
+            anchors_i32,
+            keep_i32,
+            ctx_len=int(ctx_len),
+            block_size=int(block_size),
+        )
     if backend.startswith("triton"):
         from .triton_attention import triton_dflash_attention
 
